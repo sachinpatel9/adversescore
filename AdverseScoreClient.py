@@ -20,6 +20,11 @@ class AdverseScoreClient:
         'NON_SERIOUS': 0.25
     }
 
+    PEER_GROUPS = {
+        'KEYTRUDA': ['OPDIVO', 'TECENTRIQ', 'BAVENCIO'],
+        'PEMBROLIZUMAB': ['NIVOLUMAB', 'ATEZOLIZUMAB', 'AVELUMAB']
+    }
+
     def __init__(self):
         self.api_key: str = initialize_config()
         self.session = self._get_transport_session()
@@ -225,7 +230,7 @@ class AdverseScoreClient:
 if __name__ == "__main__":
     client = AdverseScoreClient()
     #test with a common drug
-    drug_name = "TYLENOL"
+    drug_name = "KEYTRUDA"
 
     #Creating variables with default states
     raw_data = None
