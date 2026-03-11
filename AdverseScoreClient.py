@@ -29,7 +29,7 @@ class AdverseScoreClient:
         self.session = self._get_transport_session()
 
 
-    def build_query(self, drug_name: str, days_back: int = 365) -> str:
+    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500) -> str:
         '''
         Constructs a valid openFDA Lucene search query.
         Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]
@@ -46,7 +46,7 @@ class AdverseScoreClient:
         #clean and encode 
         encoded_search = search_params.replace(" ", "+")
 
-        return f"search={encoded_search}&limit=500"
+        return f"search={encoded_search}&limit={limit}"
 
     def _get_transport_session(self):
         '''
@@ -92,7 +92,8 @@ class AdverseScoreClient:
             return []
         flattened = []
         for report in raw_data.get('results', []):
-            reactions = [r.get('reactionmeddrapt', 'Unknown') for r in report.get('patient', {}).get('reaction', [])]
+            raw_reactions = report.get('patient', {}).get('reaction') or []
+            reactions = [r.get('reactionmeddrapt', 'Unknown') for r in raw_reactions]
 
             entry = {
                 'report_id': report.get('safetyreportid'),

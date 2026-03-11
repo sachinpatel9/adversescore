@@ -1,10 +1,9 @@
 import json 
 from langchain_core.tools import tool
 from AdverseScoreClient import AdverseScoreClient
-import os
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
 
 #instantiate the client globally so the HTTP session persists across multiple agent calls
 _global_client = AdverseScoreClient()
@@ -12,11 +11,11 @@ _global_client = AdverseScoreClient()
 #LangChain Tool Wrapper
 @tool
 def get_adverse_score(drug_name: str) -> str:
-    '''
+    """
     calculates a clinical safety risk score (0-100) and extracts relative reporting rates
     for a specified pharmaceutical drug based on the FDA adverse event reports
     Call this tool when a user asks about the safety, side effects, toxicity, or risk profile of a specific medication.
-    '''
+    """
     print(f'Tool Initiated: Fetching AdverseScore for {drug_name.upper()}')
 
     try:
@@ -59,46 +58,41 @@ Be objective, strictly factual, and concise. Do not use alarming or sensational 
 
 """
 
-#Create the LangChain Prompt Template
-
-prompt = ChatPromptTemplate.from_messages([
-    ('system', system_instructions),
-    ('user', '{input}'),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
-
 #group the tools
 tools = [get_adverse_score]
 
-#create the agent 
-agent = create_tool_calling_agent(llm, tools, prompt)
-
 #create the executor
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+agent_executor = create_agent(
+    model=llm, 
+    tools=tools, 
+    system_prompt=system_instructions
+)
 
 #Interactive Chat Loop
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("⚕️ ADVERSESCORE CLINICAL AGENT ONLINE")
+    print("ADVERSESCORE CLINICAL AGENT ONLINE")
     print("Type 'exit' or 'quit' to terminate the session.")
     print("="*50 + "\n")
 
     while True:
         try:
             user_input = input("\nUser: ")
-            if user_input.lower() in ['exit', 'quit']
+            if user_input.lower() in ['exit', 'quit']:
                 print('\nTerminating session. goodbye!')
                 break
             if not user_input.strip():
                 continue
 
             #execute the agent pipeline
-            response = agent_executor.invoke({'input':user_input})
+            response = agent_executor.invoke({
+                'messages': [HumanMessage(content=user_input)]
+            })
 
             print("\n" + "-"*50)
-            print(f"Agent:\n{response['output']}")
+            print(f"Agent:\n{response['messages'][-1].content}")
             print("-"*50)
-            
+
         except KeyboardInterrupt:
             print("\nTerminating session. Goodbye.")
             break
