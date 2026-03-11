@@ -15,7 +15,7 @@ class AdverseScoreClient:
         self.session = self._get_transport_session()
 
 
-    def build_query(self, drug_name: str, days_back: int = 90) -> str:
+    def build_query(self, drug_name: str, days_back: int = 365) -> str:
         '''
         Constructs a valid openFDA Lucene search query.
         Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]
@@ -27,15 +27,12 @@ class AdverseScoreClient:
         date_range = f"[{start_date}+TO+{end_date}]"
 
         #building the search parameters 
-        search_params = (
-            f'patient.drug.medicinalproduct:"{drug_name}" '
-            f'AND receivedate:{date_range}')
-        
+        search_params = f'patient.drug.medicinalproduct:"{drug_name}" AND receivedate:{date_range}'
 
         #clean and encode 
         encoded_search = search_params.replace(" ", "+")
 
-        return f"search={encoded_search}"
+        return f"search={encoded_search}&limit=100"
 
     def _get_transport_session(self):
         '''
@@ -93,10 +90,20 @@ class AdverseScoreClient:
             flattened.append(entry)
         return flattened
 
-#Quick Exection tes
+#Quick Exection
 if __name__ == "__main__":
     client = AdverseScoreClient()
     #test with a common drug
-    data = client.fetch_events('Atorvastatin')
-    if data:
-        print(f"Success: Retrieved {len(data.get('results', []))} reports.")
+    drug_name = "TYLENOL"
+    raw_data = client.fetch_events(drug_name)
+
+    if raw_data:
+        #flatten the data
+        clean_list = client._flatten_results(raw_data)
+        print(f'Successfully processed {len(clean_list)} reports for {drug_name}.')
+
+        #display the first 5 reports
+        for i, report in enumerate(clean_list[:5]):
+            print(f"Report {i+1}: ID={report['report_id']}, Date={report['date']}, Severity={report['severity']}, Company={report['company']}")
+    else:
+        print("No data retrieved.")
