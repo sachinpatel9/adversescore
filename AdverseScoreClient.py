@@ -75,15 +75,14 @@ class AdverseScoreClient:
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
         #reuse self.session defined at the class level
-        with self.session as session:
-
-            try:
-                response = session.get(full_url, timeout=10)
-                response.raise_for_status()
-                return response.json()
-            except requests.exceptions.RequestException as e:
-                print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
-                return None
+        
+        try:
+            response = session.get(full_url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
+            return None
     
     def _flatten_results(self, raw_data) -> list:
         '''
@@ -111,25 +110,26 @@ class AdverseScoreClient:
         Retrieves official FDA 'Adverse Reactions' text
         Used to identify 'Unlabeled vs Labeled signals
         '''
-        with self.session as session:
-            #openFDA label endpoint
-            label_url = 'https://api.fda.gov/drug/label.json'
-            query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
+        
+       
+        #openFDA label endpoint
+        label_url = 'https://api.fda.gov/drug/label.json'
+        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
 
-            try:
-                response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
-                response.raise_for_status()
-                data = response.json()
+        try:
+            response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
+            response.raise_for_status()
+            data = response.json()
 
-                #FDA returns a list of strings for the adverse_reactions field
-                results = data.get('results', [])
-                if results:
-                    reactions_section = results[0].get('adverse_reactions', [])
-                    return " ".join(reactions_section).lower()
-                return ""
-            except Exception:
-                #if label fails we assume 'unlabeled' and just return an empty string
-                return ""
+            #FDA returns a list of strings for the adverse_reactions field
+            results = data.get('results', [])
+            if results:
+                reactions_section = results[0].get('adverse_reactions', [])
+                return " ".join(reactions_section).lower()
+            return ""
+        except Exception:
+            #if label fails we assume 'unlabeled' and just return an empty string
+            return ""
 
     def calculate_label_penalty(self, symptoms: str, label_text: str, is_serious: bool) -> float:
         '''
@@ -158,7 +158,9 @@ class AdverseScoreClient:
 
         #check specific FDA flags for the higher 'Death' weight
         base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
-        if is_serious:
+        if report.get('is_death'):
+            base_weight = self.SEVERITY_WEIGHTS['DEATH']
+        elif is_serious:
             base_weight = self.SEVERITY_WEIGHTS['HOSPITALIZATION']
 
         #Apply label awareness penalty
@@ -166,10 +168,32 @@ class AdverseScoreClient:
 
         #calculate weighted signal
         raw_score = base_weight * penalty
-
         return raw_score
     
-    def calculate_final_score(self, drug_name: str, clean_reports: list) -> dict:
+    def get_peer_benchmark(self, drug_name: str) -> float:
+        '''
+        Calculates the average AdverseScore of peer drugs
+        '''
+        target_upper = drug_name.upper()
+        peers = self.PEER_GROUPS.get(target_upper, [])
+
+        if not peers:
+            return 0.0
+        
+        peer_scores = []
+        print(f"Benchmarking {drug_name} against peers: {', '.join(peers)}")
+
+        for peer in peers:
+            raw = self.fetch_events(peer)
+            clean = self._flatten_results(raw)
+            result = self.calculate_final_score(peer, clean, skip_benchmark=True)
+            peer_scores.append(result['adverse_score'])
+        
+        return round(sum(peer_scores) / len(peer_scores), 2) if peer_scores else 0.0
+
+        
+    
+    def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False) -> dict:
         '''
         Aggregates individual report scores into a final Adverse Score for the drug
         Implements a Recency decay and Normalization logic
@@ -180,6 +204,8 @@ class AdverseScoreClient:
             'adverse_score': 0,
             'status': 'Incomplete Data',
             'report_count': 0,
+            'benchmark_avg': 0.0,
+            'relative_risk': 'N/A'
             }
         
         #fetch label text once for this drug to use in the loop 
@@ -189,41 +215,43 @@ class AdverseScoreClient:
         ninety_days_ago = datetime.now() - timedelta(days=90)
 
         for report in clean_reports:
-            #calculate base weighted score
-            if report.get('is_death'):
-                base_weight = self.SEVERITY_WEIGHTS['DEATH']
-            elif report.get('severity') == 'Serious':
-                base_weight = self.SEVERITY_WEIGHTS['HOSPITALIZATION']
-            else:
-                base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
-            
-            #apply label penalty
-            penalty = self.calculate_label_penalty(report['symptoms'], label_text, report['severity'] == 'Serious')
-            report_score = base_weight * penalty
+            report_score = self._calculate_report_score(report, label_text)
 
-            #apply recency decay (3 month delay)
-            report_date = datetime.strptime(report['date'], "%Y%m%d")
-            decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
+            try:
+                report_date = datetime.strptime(report['date'], "%Y%m%d")
+                decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
+            except (ValueError, TypeError):
+                decay_multiplier = 1.0
             
             total_weighted_points += (report_score * decay_multiplier)
         
-        #Normalize & Scale
         mean_signal = total_weighted_points / len(clean_reports)
-
-        #scaling factor: adjusted to make 'serious' / 'unlabeled' events spike the score
         final_score = min(100, round(mean_signal * 40, 2))
 
-        #determine status tone
+        #Add f-string formatting
         status = 'Stable'
         if final_score > 70: status = 'High Signal - Urgent Review'
         elif final_score > 30: status = f'Monitor - Emerging Trend for {drug_name}'
-        
+
+        #execute benchmarking 
+        benchmark_avg = 0.0
+        relative_risk = 'N/A'
+        if not skip-skip_benchmark:
+            benchmark_avg = self.get_peer_benchmark(drug_name)
+            if benchmark_avg > 0:
+                relative_risk = 'Average'
+                if final_score > (benchmark_avg * 1.5):
+                    relative_risk = 'Elevated vs Class Peers'
+                elif final_score < (benchmark_avg * 0.7):
+                    relative_risk = 'Lower than Class Peers'
 
         return {
             'drug': drug_name,
             'adverse_score': final_score,
             'status': status,
             'report_count': len(clean_reports),
+            'benchmark_avg': benchmark_avg,
+            'relative_risk': relative_risk
         }
 
 
@@ -250,8 +278,10 @@ if __name__ == "__main__":
     final_result = client.calculate_final_score(drug_name, clean_list)
     
     print("\n--- ADVERSE SCORE SUMMARY ---")
-    print(f"Drug:    {final_result['drug']}")
-    print(f"Score:   {final_result['adverse_score']}/100")
-    print(f"Status:  {final_result['status']}")
-    print(f"Reports: {final_result['report_count']}")
+    print(f"Drug:          {final_result['drug']}")
+    print(f"Score:         {final_result['adverse_score']}/100")
+    print(f"Status:        {final_result['status']}")
+    print(f"Reports:       {final_result['report_count']}")
+    print(f"Peer Average:  {final_result['benchmark_avg']}")
+    print(f"Relative Risk: {final_result['relative_risk']}")
     print("------------------------------")
