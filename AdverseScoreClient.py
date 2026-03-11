@@ -89,6 +89,48 @@ class AdverseScoreClient:
             }
             flattened.append(entry)
         return flattened
+    
+    def fetch_label_text(self, drug_name: str) -> str:
+        '''
+        Retrieves official FDA 'Adverse Reactions' text
+        Used to identify 'Unlabeled vs Labeled signals
+        '''
+        #openFDA label endpoint
+        label_url = 'https://api.fda.gov/drug/label.json'
+        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
+
+        try:
+            response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            #FDA returns a list of strings for the adverse_reactions field
+            results = data.get('results', [])
+            if results:
+                reactions_section = results[0].get('adverse_reactions', [])
+                return " ".join(reactions_section).lower()
+            return ""
+        except Exception:
+            #if label fails we assume 'unlabeled' and just return an empty string
+            return ""
+
+    def calculate_label_penalty(self, symptoms: str, label_text: str, is_serious: bool) -> float:
+        '''
+        Apply the penalty factors defined. 
+        Unlabeled + Serious: 2.0x | Unlabeled + Non-Serious: 1.5x | Labeled: 1.0x 
+        '''
+        if not label_text:
+            return 2.0 if is_serious else 1.5
+        
+        #check if any reported symptoms is MISSING from the label text - implementing simple key word matching for now, could be improved with NLP techniques
+        symptom_list = [s.strip().lower() for s in symptoms.split(",")]
+        is_labeled = any(s in label_text for s in symptom_list)
+
+        if not is_labeled:
+            return 2.0 if is_serious else 1.5
+        return 1.0
+
+
 
 #Quick Exection
 if __name__ == "__main__":
