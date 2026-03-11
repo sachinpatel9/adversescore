@@ -38,7 +38,6 @@ def get_adverse_score(drug_name: str) -> str:
 llm = ChatOpenAI(
     model="gpt-4o", 
     temperature=0.0,
-    api_key=os.getenv('OPENAI_API_KEY') 
 )
 
 #define the prompt 
@@ -66,21 +65,6 @@ prompt = ChatPromptTemplate.from_messages([
     ('user', '{input}'),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
