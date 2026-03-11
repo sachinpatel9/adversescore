@@ -7,8 +7,18 @@ from datetime import datetime, timedelta
 #Integration: import the validator from config.py
 from config import initialize_config
 
+
+
 class AdverseScoreClient:
     base_url = "https://api.fda.gov/drug/event.json"
+
+    #Class Attributes 
+    SEVERITY_WEIGHTS = {
+        'DEATH': 1.75,
+        'HOSPITALIZATION': 1.0,
+        'OTHER_SERIOUS': 0.75,
+        'NON_SERIOUS': 0.25
+    }
 
     def __init__(self):
         self.api_key: str = initialize_config()
@@ -85,6 +95,8 @@ class AdverseScoreClient:
                 'report_id': report.get('safetyreportid'),
                 'date': report.get('receivedate'),
                 'severity': 'Serious' if report.get('seriousness') == 1 else 'Non-Serious',
+                'is_death': report.get('seriousnessdeath') == 1,
+                'symptoms': ", ".join(reactions),
                 'company': report.get('companynumb', 'N/A')
             }
             flattened.append(entry)
@@ -130,7 +142,27 @@ class AdverseScoreClient:
             return 2.0 if is_serious else 1.5
         return 1.0
 
+    def _calculate_report_score(self, report: dict, label_text: str) -> float:
+        '''
+        Calculates a weighted score for a single adverse event
+        Logic: (Base Weight * Label Penalty) * Recency Factor
+        '''
+        #determine base severity weight
+        is_serious = report.get('severity') == 'Serious'
+        symptoms = report.get('symptoms', '')
 
+        #check specific FDA flags for the higher 'Death' weight
+        base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
+        if is_serious:
+            base_weight = self.SEVERITY_WEIGHTS['HOSPITALIZATION']
+
+        #Apply label awareness penalty
+        penalty = self.calculate_label_penalty(symptoms, label_text, is_serious)
+
+        #calculate weighted signal
+        raw_score = base_weight * penalty
+
+        return raw_score
 
 #Quick Exection
 if __name__ == "__main__":
