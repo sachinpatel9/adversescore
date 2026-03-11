@@ -45,7 +45,7 @@ class AdverseScoreClient:
         #clean and encode 
         encoded_search = search_params.replace(" ", "+")
 
-        return f"search={encoded_search}&limit=100"
+        return f"search={encoded_search}&limit=500"
 
     def _get_transport_session(self):
         '''
@@ -74,10 +74,9 @@ class AdverseScoreClient:
         query_params = self.build_query(drug_name)
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
-        #reuse self.session defined at the class level
         
         try:
-            response = session.get(full_url, timeout=10)
+            response = self.session.get(full_url, timeout=10)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -236,7 +235,7 @@ class AdverseScoreClient:
         #execute benchmarking 
         benchmark_avg = 0.0
         relative_risk = 'N/A'
-        if not skip-skip_benchmark:
+        if not skip_benchmark:
             benchmark_avg = self.get_peer_benchmark(drug_name)
             if benchmark_avg > 0:
                 relative_risk = 'Average'
