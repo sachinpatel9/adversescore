@@ -289,6 +289,10 @@ class AdverseScoreClient:
         #integrate calculate confidence
         confidence_metrics = self._calculate_confidence(clean_reports)
 
+        #integrate guardrails
+        guardrails = self._generate_guardrails(final_score, confidence_metrics)
+
+
         return {
             'drug': drug_name,
             'adverse_score': final_score,
@@ -296,8 +300,42 @@ class AdverseScoreClient:
             'report_count': len(clean_reports),
             'benchmark_avg': benchmark_avg,
             'relative_risk': relative_risk,
-            'confidence': confidence_metrics
+            'confidence': confidence_metrics,
+            'guardrails': guardrails
         }
+
+    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict) -> dict:
+        '''
+        Generates deterministic boolean flags to control AI behavior
+        Prevents hallucination and ensures clinical safety protocols
+        '''
+        confidence_level = confidence_metrics.get('level', 'Low')
+
+        diagnosis_lock = True
+
+        #human in the loop triggers
+        requires_human_review = False
+        if adverse_score > 70:
+            requires_human_review = True
+        elif adverse_score > 40 and confidence_level == 'Low':
+            requires_human_review = True
+        
+        #specialist routing
+        route_to_specialist = adverse_score > 60
+
+        return {
+            "diagnosis_lock": diagnosis_lock,
+            "requires_human_review": requires_human_review,
+            "route_to_specialist": route_to_specialist,
+            "system_directive": "Halt autonomous clinical advice if requires_human_review is True."
+        }
+
+
+
+
+
+
+
 
 
 #Quick Exection
