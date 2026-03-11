@@ -4,6 +4,7 @@ from AdverseScoreClient import AdverseScoreClient
 import os
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_tool_calling_agent, AgentExecutor
 
 #instantiate the client globally so the HTTP session persists across multiple agent calls
 _global_client = AdverseScoreClient()
@@ -66,9 +67,40 @@ prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
+#group the tools
+tools = [get_adverse_score]
 
+#create the agent 
+agent = create_tool_calling_agent(llm, tools, prompt)
 
-# Quick verification test
+#create the executor
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+#Interactive Chat Loop
 if __name__ == "__main__":
-    print(f"Tool Name: {get_adverse_score.name}")
-    print(f"Tool Description: {get_adverse_score.description}") 
+    print("\n" + "="*50)
+    print("⚕️ ADVERSESCORE CLINICAL AGENT ONLINE")
+    print("Type 'exit' or 'quit' to terminate the session.")
+    print("="*50 + "\n")
+
+    while True:
+        try:
+            user_input = input("\nUser: ")
+            if user_input.lower() in ['exit', 'quit']
+                print('\nTerminating session. goodbye!')
+                break
+            if not user_input.strip():
+                continue
+
+            #execute the agent pipeline
+            response = agent_executor.invoke({'input':user_input})
+
+            print("\n" + "-"*50)
+            print(f"Agent:\n{response['output']}")
+            print("-"*50)
+            
+        except KeyboardInterrupt:
+            print("\nTerminating session. Goodbye.")
+            break
+        except Exception as e:
+            print(f"\n[System Error]: {e}")
