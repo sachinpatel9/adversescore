@@ -73,6 +73,25 @@ class AdverseScoreClient:
         except requests.exceptions.RequestException as e:
             print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
             return None
+    
+    def _flatten_results(self, raw_data) -> list:
+        '''
+        Transforms messy FDA JSON into a flat, Agent-friendly list of dictionaries
+        '''
+        if not raw_data or 'results' not in raw_data:
+            return []
+        flattened = []
+        for report in raw_data.get('results', []):
+            reactions = [r.get('reactionmeddrapt', 'Unknown') for r in report.get('patient', {}).get('reaction', [])]
+
+            entry = {
+                'report_id': report.get('safetyreportid'),
+                'date': report.get('receivedate'),
+                'severity': 'Serious' if report.get('seriousness') == 1 else 'Non-Serious',
+                'company': report.get('companynumb', 'N/A')
+            }
+            flattened.append(entry)
+        return flattened
 
 #Quick Exection tes
 if __name__ == "__main__":
