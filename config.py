@@ -1,19 +1,26 @@
 import os
-
 from dotenv import load_dotenv
 
-def initialize_config():
-    '''
-    Loads environment variables and validates presence of API key
-    '''
+def initialize_config() -> str:
+    """
+    Loads environment variables and validates the presence of all required API keys.
+    Returns the openFDA API key for the AdverseScoreClient.
+    """
     load_dotenv()
-    api_key = os.getenv('OPENFDA_API_KEY')
+    
+    fda_key = os.getenv('OPENFDA_API_KEY')
+    openai_key = os.getenv('OPENAI_API_KEY')
 
-    if not api_key:
-        raise EnvironmentError('OPENFDA_API_KEY is not set in environment variables. Please set it in your .env file')
-    print('Configuration initialized successfully. API key loaded.')
-    return api_key
+    # Fail Fast Validations
+    if not fda_key:
+        raise EnvironmentError("OPENFDA_API_KEY is not set in environment variables. Please set it in your .env file.")
+    
+    if not openai_key:
+        raise EnvironmentError("OPENAI_API_KEY is not set. The LangChain Agent requires this to execute.")
 
-#execution 
+    return fda_key
+
+# Execution block for testing the config directly
 if __name__ == '__main__':
     key = initialize_config()
+    print("Configuration initialized successfully. All required keys are present.")
