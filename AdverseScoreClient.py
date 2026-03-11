@@ -187,7 +187,8 @@ class AdverseScoreClient:
             raw = self.fetch_events(peer)
             clean = self._flatten_results(raw)
             result = self.calculate_final_score(peer, clean, skip_benchmark=True)
-            peer_scores.append(result['adverse_score'])
+            peer_score = result['clinical_signal']['adverse_score']
+            peer_scores.append(peer_score)
         
         return round(sum(peer_scores) / len(peer_scores), 2) if peer_scores else 0.0
 
@@ -198,7 +199,7 @@ class AdverseScoreClient:
         '''
         total_reports = len(clean_reports)
         if total_reports == 0:
-            return {'level': 'None', 'score': 0.0, 'reason': 'No data available'}
+            return {'level': 'None', 'metric': 0.0, 'defect_ratio': 0.0}
         
         #Volume Assessment
         if total_reports >= 80:
@@ -232,6 +233,32 @@ class AdverseScoreClient:
             'level': level,
             'metric': round(final_confidence_score, 1),
             'defect_ratio': round(quality_defect_ratio, 2),
+        }
+
+    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict) -> dict:
+        '''
+        Generates deterministic boolean flags to control AI behavior
+        Prevents hallucination and ensures clinical safety protocols
+        '''
+        confidence_level = confidence_metrics.get('level', 'Low')
+
+        diagnosis_lock = True
+
+        #human in the loop triggers
+        requires_human_review = False
+        if adverse_score > 70:
+            requires_human_review = True
+        elif adverse_score > 40 and confidence_level == 'Low':
+            requires_human_review = True
+        
+        #specialist routing
+        route_to_specialist = adverse_score > 60
+
+        return {
+            "diagnosis_lock": diagnosis_lock,
+            "requires_human_review": requires_human_review,
+            "route_to_specialist": route_to_specialist,
+            "system_directive": "Halt autonomous clinical advice if requires_human_review is True."
         }
 
     
@@ -337,32 +364,7 @@ class AdverseScoreClient:
         return agent_payload
 
 
-    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict) -> dict:
-        '''
-        Generates deterministic boolean flags to control AI behavior
-        Prevents hallucination and ensures clinical safety protocols
-        '''
-        confidence_level = confidence_metrics.get('level', 'Low')
-
-        diagnosis_lock = True
-
-        #human in the loop triggers
-        requires_human_review = False
-        if adverse_score > 70:
-            requires_human_review = True
-        elif adverse_score > 40 and confidence_level == 'Low':
-            requires_human_review = True
-        
-        #specialist routing
-        route_to_specialist = adverse_score > 60
-
-        return {
-            "diagnosis_lock": diagnosis_lock,
-            "requires_human_review": requires_human_review,
-            "route_to_specialist": route_to_specialist,
-            "system_directive": "Halt autonomous clinical advice if requires_human_review is True."
-        }
-
+    
 
 
 #Quick Exection
@@ -387,12 +389,12 @@ if __name__ == "__main__":
     print(json.dumps(final_result, indent=2))
     
     print("\n--- ADVERSE SCORE SUMMARY ---")
-    print(f"Drug:          {final_result['drug']}")
-    print(f"Score:         {final_result['adverse_score']}/100")
-    print(f"Status:        {final_result['status']}")
-    print(f"Reports:       {final_result['report_count']}")
-    print(f"Peer Average:  {final_result['benchmark_avg']}")
-    print(f"Relative Risk: {final_result['relative_risk']}")
-    print(f"Confidence:    {final_result['confidence']}")
-    print(f"Guardrails:    {final_result['guardrails']}")
+    print(f"Drug:          {final_result['clinical_signal']['drug_target']}")
+    print(f"Score:         {final_result['clinical_signal']['adverse_score']}/100")
+    print(f"Status:        {final_result['clinical_signal']['status']}")
+    print(f"Reports:       {final_result['data_integrity']['report_count']}")
+    print(f"Peer Average:  {final_result['clinical_signal']['class_benchmark_avg']}")
+    print(f"Relative Risk: {final_result['clinical_signal']['relative_risk']}")
+    print(f"Confidence:    {final_result['data_integrity']['confidence_level']}")
+    print(f"Diagnosis Lock:{final_result['agent_directives']['diagnosis_lock']}")
     print("------------------------------")
