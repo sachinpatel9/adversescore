@@ -3,6 +3,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
+import _strptime
 
 #Integration: import the validator from config.py
 from config import initialize_config
@@ -163,6 +164,63 @@ class AdverseScoreClient:
         raw_score = base_weight * penalty
 
         return raw_score
+    
+    def calculate_final_score(self, drug_name: str, clean_reports: list) -> dict:
+        '''
+        Aggregates individual report scores into a final Adverse Score for the drug
+        Implements a Recency decay and Normalization logic
+        '''
+        if not clean_reports:
+            return {'score': 0, 'status': 'Incomplete Data'}
+        
+        #fetch label text once for this drug to use in the loop 
+        label_text = self.fetch_label_text(drug_name)
+
+        total_weighted_points = 0
+        ninety_days_ago = datetime.now() - timedelta(days=90)
+
+        for report in clean_reports:
+            #calculate base weighted score
+            if report.get('is_death'):
+                base_weight = self.SEVERITY_WEIGHTS['DEATH']
+            elif report.get('severity') == 'Serious':
+                base_weight = self.SEVERITY_WEIGHTS['HOSPITALIZATION']
+            else:
+                base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
+            
+            #apply label penalty
+            penalty = self.calculate_label_penalty(report['symptoms'], label_text, report['severity'] == 'Serious')
+            report_score = base_weight * penalty
+
+            #apply recency decay (3 month delay)
+            report_date = datetime/strptime(report['date'], "%Y%m%d")
+            decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
+            
+            total_weighted_points += (report_score * decay_multiplier)
+        
+        #Normalize & Scale
+        mean_signal = total_weighted_points / len(clean_reports)
+
+        #scaling factor: adjusted to make 'serious' / 'unlabeled' events spike the score
+        final_score = min(100, round(mean_signal * 40, 2))
+
+        #determine status tone
+        status = 'Stable'
+        if final_score > 70: status = 'High Signal - Urgent Review'
+        elif final_score > 30: status = 'Monitor - Emerging Trend for {drug_name}'
+
+        return {
+            'drug': drug_name,
+            'adverse_score': final_score,
+            'status': status,
+            'report_count': len(clean_reports)
+        }
+
+
+
+
+
+
 
 #Quick Exection
 if __name__ == "__main__":
@@ -181,3 +239,5 @@ if __name__ == "__main__":
             print(f"Report {i+1}: ID={report['report_id']}, Date={report['date']}, Severity={report['severity']}, Company={report['company']}")
     else:
         print("No data retrieved.")
+
+    client.calculate_final_score(drug_name, clean_list)
