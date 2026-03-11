@@ -3,8 +3,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
-from datetime import datetime, timedelta
-#Integration: import the validator from config.py
 from config import initialize_config
 
 
@@ -76,15 +74,16 @@ class AdverseScoreClient:
         query_params = self.build_query(drug_name)
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
-        session = self._get_transport_session()
+        #reuse self.session defined at the class level
+        with self.session as session:
 
-        try:
-            response = session.get(full_url, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
-            return None
+            try:
+                response = session.get(full_url, timeout=10)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
+                return None
     
     def _flatten_results(self, raw_data) -> list:
         '''
@@ -99,8 +98,8 @@ class AdverseScoreClient:
             entry = {
                 'report_id': report.get('safetyreportid'),
                 'date': report.get('receivedate'),
-                'severity': 'Serious' if report.get('seriousness') == 1 else 'Non-Serious',
-                'is_death': report.get('seriousnessdeath') == 1,
+                'severity': 'Serious' if report.get('seriousness') == '1' else 'Non-Serious',
+                'is_death': report.get('seriousnessdeath') == '1',
                 'symptoms': ", ".join(reactions),
                 'company': report.get('companynumb', 'N/A')
             }
@@ -112,24 +111,25 @@ class AdverseScoreClient:
         Retrieves official FDA 'Adverse Reactions' text
         Used to identify 'Unlabeled vs Labeled signals
         '''
-        #openFDA label endpoint
-        label_url = 'https://api.fda.gov/drug/label.json'
-        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
+        with self.session as session:
+            #openFDA label endpoint
+            label_url = 'https://api.fda.gov/drug/label.json'
+            query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
 
-        try:
-            response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            try:
+                response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
+                response.raise_for_status()
+                data = response.json()
 
-            #FDA returns a list of strings for the adverse_reactions field
-            results = data.get('results', [])
-            if results:
-                reactions_section = results[0].get('adverse_reactions', [])
-                return " ".join(reactions_section).lower()
-            return ""
-        except Exception:
-            #if label fails we assume 'unlabeled' and just return an empty string
-            return ""
+                #FDA returns a list of strings for the adverse_reactions field
+                results = data.get('results', [])
+                if results:
+                    reactions_section = results[0].get('adverse_reactions', [])
+                    return " ".join(reactions_section).lower()
+                return ""
+            except Exception:
+                #if label fails we assume 'unlabeled' and just return an empty string
+                return ""
 
     def calculate_label_penalty(self, symptoms: str, label_text: str, is_serious: bool) -> float:
         '''
@@ -175,7 +175,12 @@ class AdverseScoreClient:
         Implements a Recency decay and Normalization logic
         '''
         if not clean_reports:
-            return {'score': 0, 'status': 'Incomplete Data'}
+            return {
+            'drug': drug_name,
+            'adverse_score': 0,
+            'status': 'Incomplete Data',
+            'report_count': 0,
+            }
         
         #fetch label text once for this drug to use in the loop 
         label_text = self.fetch_label_text(drug_name)
@@ -211,17 +216,15 @@ class AdverseScoreClient:
         #determine status tone
         status = 'Stable'
         if final_score > 70: status = 'High Signal - Urgent Review'
-        elif final_score > 30: status = 'Monitor - Emerging Trend for {drug_name}'
+        elif final_score > 30: status = f'Monitor - Emerging Trend for {drug_name}'
+        
 
         return {
             'drug': drug_name,
             'adverse_score': final_score,
             'status': status,
-            'report_count': len(clean_reports)
+            'report_count': len(clean_reports),
         }
-
-
-
 
 
 
