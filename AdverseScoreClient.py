@@ -4,6 +4,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from config import initialize_config
+import json
 
 
 
@@ -241,12 +242,30 @@ class AdverseScoreClient:
         '''
         if not clean_reports:
             return {
-            'drug': drug_name,
-            'adverse_score': 0,
-            'status': 'Incomplete Data',
-            'report_count': 0,
-            'benchmark_avg': 0.0,
-            'relative_risk': 'N/A'
+                "metadata": {
+                    "tool_name": "AdverseScore",
+                    "version": "1.0",
+                    "timestamp": datetime.now().isoformat() + "Z",
+                    "clinical_disclaimer": "This score is for informational purposes only and does not constitute medical advice. The responsibility ultimately remains with the clinician."
+                },
+                "clinical_signal": {
+                    "drug_target": drug_name.upper(),
+                    "adverse_score": 0.0,
+                    "status": "Incomplete Data",
+                    "relative_risk": "N/A",
+                    "class_benchmark_avg": 0.0
+                },
+                "data_integrity": {
+                    "report_count": 0,
+                    "confidence_level": "None",
+                    "defect_ratio": 0.0
+                },
+                "agent_directives": {
+                    "diagnosis_lock": True,
+                    "requires_human_review": False,
+                    "route_to_specialist": False,
+                    "system_directive": "Inform the user that insufficient safety data exists in the openFDA database for this drug. Do not attempt to calculate a risk profile."
+                }
             }
         
         #fetch label text once for this drug to use in the loop 
@@ -292,17 +311,31 @@ class AdverseScoreClient:
         #integrate guardrails
         guardrails = self._generate_guardrails(final_score, confidence_metrics)
 
-
-        return {
-            'drug': drug_name,
-            'adverse_score': final_score,
-            'status': status,
-            'report_count': len(clean_reports),
-            'benchmark_avg': benchmark_avg,
-            'relative_risk': relative_risk,
-            'confidence': confidence_metrics,
-            'guardrails': guardrails
+        #integrate the payload schema
+        agent_payload = {
+            "metadata": {
+                "tool_name": "AdverseScore",
+                "version": "1.0",
+                "timestamp": datetime.now().isoformat() + "Z",
+                "clinical_disclaimer": "This score is for informational purposes only and does not constitute medical advice. The responsibility ultimately remains with the clinician."
+            },
+            "clinical_signal": {
+                "drug_target": drug_name.upper(),
+                "adverse_score": final_score,
+                "status": status,
+                "relative_risk": relative_risk,
+                "class_benchmark_avg": benchmark_avg
+            },
+            "data_integrity": {
+                "report_count": len(clean_reports),
+                "confidence_level": confidence_metrics.get("level"),
+                "defect_ratio": confidence_metrics.get("defect_ratio")
+            },
+            "agent_directives": guardrails
         }
+
+        return agent_payload
+
 
     def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict) -> dict:
         '''
@@ -332,12 +365,6 @@ class AdverseScoreClient:
 
 
 
-
-
-
-
-
-
 #Quick Exection
 if __name__ == "__main__":
     client = AdverseScoreClient()
@@ -357,6 +384,7 @@ if __name__ == "__main__":
         print(f'Successfully processed {len(clean_list)} reports for {drug_name}.')
 
     final_result = client.calculate_final_score(drug_name, clean_list)
+    print(json.dumps(final_result, indent=2))
     
     print("\n--- ADVERSE SCORE SUMMARY ---")
     print(f"Drug:          {final_result['drug']}")
@@ -365,4 +393,6 @@ if __name__ == "__main__":
     print(f"Reports:       {final_result['report_count']}")
     print(f"Peer Average:  {final_result['benchmark_avg']}")
     print(f"Relative Risk: {final_result['relative_risk']}")
+    print(f"Confidence:    {final_result['confidence']}")
+    print(f"Guardrails:    {final_result['guardrails']}")
     print("------------------------------")
