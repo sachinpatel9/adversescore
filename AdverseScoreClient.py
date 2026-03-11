@@ -1,0 +1,83 @@
+import urllib.parse
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime, timedelta
+
+#Integration: import the validator from config.py
+from config import initialize_config
+
+class AdverseScoreClient:
+    base_url = "https://api.fda.gov/drug/event.json"
+
+    def __init__(self):
+        self.api_key: str = initialize_config()
+        self.session = self._get_transport_session()
+
+
+    def build_query(self, drug_name: str, days_back: int = 90) -> str:
+        '''
+        Constructs a valid openFDA Lucene search query.
+        Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]
+        '''
+
+        #Handle dates: YYYYMMDD format
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+        date_range = f"[{start_date}+TO+{end_date}]"
+
+        #building the search parameters 
+        search_params = (
+            f'patient.drug.medicinalproduct:"{drug_name}" '
+            f'AND receivedate:{date_range}')
+        
+
+        #clean and encode 
+        encoded_search = search_params.replace(" ", "+")
+
+        return f"search={encoded_search}"
+
+    def _get_transport_session(self):
+        '''
+        Creates a session with automated retry logic
+        handles 429 (rate limit), 500, 502, 503, 504 errors
+        '''
+        session = requests.Session()
+        #configure retries
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429,500,502,503,504],
+            allowed_methods=['GET']
+        )
+
+        #mount the adapter to the session
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('https://', adapter)
+
+        return session
+
+    def fetch_events(self, drug_name: str):
+        '''
+        Executes the API call using the query builder and the session
+        '''
+        query_params = self.build_query(drug_name)
+        full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
+
+        session = self._get_transport_session()
+
+        try:
+            response = session.get(full_url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
+            return None
+
+#Quick Exection tes
+if __name__ == "__main__":
+    client = AdverseScoreClient()
+    #test with a common drug
+    data = client.fetch_events('Atorvastatin')
+    if data:
+        print(f"Success: Retrieved {len(data.get('results', []))} reports.")
