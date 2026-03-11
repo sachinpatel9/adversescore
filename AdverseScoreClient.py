@@ -3,8 +3,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
-import _strptime
-
+from datetime import datetime, timedelta
 #Integration: import the validator from config.py
 from config import initialize_config
 
@@ -193,7 +192,7 @@ class AdverseScoreClient:
             report_score = base_weight * penalty
 
             #apply recency decay (3 month delay)
-            report_date = datetime/strptime(report['date'], "%Y%m%d")
+            report_date = datetime.strptime(report['date'], "%Y%m%d")
             decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
             
             total_weighted_points += (report_score * decay_multiplier)
@@ -227,6 +226,12 @@ if __name__ == "__main__":
     client = AdverseScoreClient()
     #test with a common drug
     drug_name = "TYLENOL"
+
+    #Creating variables with default states
+    raw_data = None
+    clean_list = []
+
+    print(f'Querying openFDA for {drug_name} signals')
     raw_data = client.fetch_events(drug_name)
 
     if raw_data:
@@ -234,10 +239,11 @@ if __name__ == "__main__":
         clean_list = client._flatten_results(raw_data)
         print(f'Successfully processed {len(clean_list)} reports for {drug_name}.')
 
-        #display the first 5 reports
-        for i, report in enumerate(clean_list[:5]):
-            print(f"Report {i+1}: ID={report['report_id']}, Date={report['date']}, Severity={report['severity']}, Company={report['company']}")
-    else:
-        print("No data retrieved.")
-
-    client.calculate_final_score(drug_name, clean_list)
+    final_result = client.calculate_final_score(drug_name, clean_list)
+    
+    print("\n--- ADVERSE SCORE SUMMARY ---")
+    print(f"Drug:    {final_result['drug']}")
+    print(f"Score:   {final_result['adverse_score']}/100")
+    print(f"Status:  {final_result['status']}")
+    print(f"Reports: {final_result['report_count']}")
+    print("------------------------------")
