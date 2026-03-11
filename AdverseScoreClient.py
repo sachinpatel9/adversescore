@@ -190,7 +190,49 @@ class AdverseScoreClient:
         
         return round(sum(peer_scores) / len(peer_scores), 2) if peer_scores else 0.0
 
+    def _calculate_confidence(self, clean_reports: list) -> dict:
+        '''
+        Evaluates the statistical reliability of the AdverseScore. 
+        Analyzes sample size (N) and data completeness
+        '''
+        total_reports = len(clean_reports)
+        if total_reports == 0:
+            return {'level': 'None', 'score': 0.0, 'reason': 'No data available'}
         
+        #Volume Assessment
+        if total_reports >= 80:
+            base_confidence = 100.0
+        elif total_reports >= 50:
+            base_confidence = 90.0
+        else: 
+            base_confidence = 40.0
+        
+        #Quality Assessment
+        low_quality_counts = sum(
+            1 for r in clean_reports
+            if not r.get('date') or r.get('symptoms') == 'Unknown'
+        )
+        quality_defect_ratio = low_quality_counts / total_reports
+
+
+        #Elegant Penalty
+        final_confidence_score = base_confidence - (quality_defect_ratio * 50)
+        final_confidence_score = max(0.0, final_confidence_score)
+
+        #Categorical Level for the AI Prompt
+        if final_confidence_score >= 80:
+            level = 'High'
+        elif final_confidence_score >= 50:
+            level = 'Medium'
+        else:
+            level = 'Low'
+        
+        return {
+            'level': level,
+            'metric': round(final_confidence_score, 1),
+            'defect_ratio': round(quality_defect_ratio, 2),
+        }
+
     
     def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False) -> dict:
         '''
@@ -243,6 +285,9 @@ class AdverseScoreClient:
                     relative_risk = 'Elevated vs Class Peers'
                 elif final_score < (benchmark_avg * 0.7):
                     relative_risk = 'Lower than Class Peers'
+        
+        #integrate calculate confidence
+        confidence_metrics = self._calculate_confidence(clean_reports)
 
         return {
             'drug': drug_name,
@@ -250,10 +295,9 @@ class AdverseScoreClient:
             'status': status,
             'report_count': len(clean_reports),
             'benchmark_avg': benchmark_avg,
-            'relative_risk': relative_risk
+            'relative_risk': relative_risk,
+            'confidence': confidence_metrics
         }
-
-
 
 
 #Quick Exection
