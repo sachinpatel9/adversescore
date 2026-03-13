@@ -1,5 +1,5 @@
 import json 
-from AdverseScoreClient import AdverseScoreClient
+from .client import AdverseScoreClient
 
 adverse_score_tool_schema = {
     "type": "function",

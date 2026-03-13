@@ -1,9 +1,10 @@
 import json 
 from langchain_core.tools import tool
-from AdverseScoreClient import AdverseScoreClient
+from .client import AdverseScoreClient
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
+from .config import initialize_config
 
 #instantiate the client globally so the HTTP session persists across multiple agent calls
 _global_client = AdverseScoreClient()

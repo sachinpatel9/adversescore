@@ -3,7 +3,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
-from config import initialize_config
+from .config import initialize_config
 import json
 
 
