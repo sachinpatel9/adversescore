@@ -24,7 +24,7 @@ class AdverseScoreClient:
         self.session = self._get_transport_session()
 
 
-    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500) -> str:
+    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500, patient_age: int = None, patient_sex: str = None) -> str:  # type: ignore
         '''
         Constructs a valid openFDA Lucene search query.
         Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]
@@ -37,6 +37,23 @@ class AdverseScoreClient:
 
         #building the search parameters 
         search_params = f'patient.drug.medicinalproduct:"{drug_name}" AND receivedate:{date_range}'
+
+        #Inject Demographic Filters
+        if patient_sex:
+            #openFDA sex coding 
+            sex_code = "1" if patient_sex.upper() == "F" else "2"
+            search_params += f' AND patient.patientsex:{sex_code}'
+
+        if patient_age:
+            #create a 10 year age cohort bracket to ensure adequate sample size
+            lower_bound = max(0, patient_age - 5)
+            upper_bound = patient_age + 5
+            search_params += f' AND patient.patientonsetage:[{lower_bound}+TO+{upper_bound}]'
+        
+        encoded_search = search_params.replace(" ", "+")
+
+        return f"search={encoded_search}&limit={limit}"
+
 
         #clean and encode 
         encoded_search = search_params.replace(" ", "+")
@@ -63,14 +80,13 @@ class AdverseScoreClient:
 
         return session
 
-    def fetch_events(self, drug_name: str):
+    def fetch_events(self, drug_name: str, patient_age: int = None, patient_sex: str = None): # type: ignore
         '''
         Executes the API call using the query builder and the session
         '''
-        query_params = self.build_query(drug_name)
+        query_params = self.build_query(drug_name, patient_age=patient_age, patient_sex=patient_sex)
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
-        
         try:
             response = self.session.get(full_url, timeout=10)
             response.raise_for_status()

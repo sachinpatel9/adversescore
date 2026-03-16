@@ -37,7 +37,7 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
         print(f'[Agent Network] Demographics Extracted -> Age: {patient_age}, Sex: {patient_sex}')
     
     try:
-        raw_data = _global_client.fetch_events(drug_name)
+        raw_data = _global_client.fetch_events(drug_name, patient_age, patient_sex)
         clean_list = _global_client._flatten_results(raw_data) if raw_data else []
         agent_payload = _global_client.calculate_final_score(drug_name, clean_list)
 
