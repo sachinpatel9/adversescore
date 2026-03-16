@@ -188,7 +188,7 @@ class AdverseScoreClient:
         '''
         Discovers the primary therapeutic class using frequency analysis on historical adverse event data, bypassing label noise
         '''
-        url = "https://api.fda.gov/drug/label.json"
+        url = "https://api.fda.gov/drug/event.json"
         #search by brand or generic name
         target_name = drug_name.upper()
         
