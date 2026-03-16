@@ -192,11 +192,15 @@ class AdverseScoreClient:
         #search by brand or generic name
         target_name = drug_name.upper()
         
-        query = f'search=(patient.drug.openfda.brand_name:"{target_name}"+OR+patient.drug.openfda.generic_name:"{target_name}")'
-        count_param = "&count=patient.drug.openfda.pharm_class_epc.exact"
+        #build the clean search string
+        search_str = f'patient.drug.openfda.brand_name:"{target_name}"'
+
+        #safely encode the url to prevent 400 request errors
+        encoded_search = urllib.parse.quote(search_str)
+        count_param = "patient.drug.openfda.pharm_class_epc.exact"
 
         try:
-            full_url = f"{url}?{query}{count_param}&api_key={self.api_key}"
+            full_url = f"{url}?search={encoded_search}&count={count_param}&api_key={self.api_key}"
             print(f"[Discovery] Attempting algorithmic class mapping for {target_name}...")
 
             response = self.session.get(full_url, timeout=10)
@@ -211,8 +215,8 @@ class AdverseScoreClient:
                 return primary_class
             
             return ""
-        except Exception:
-            print(f"[Discovery] Event based discovery failed. Falling back to label metadata...")
+        except Exception as e:
+            print(f"[Discovery] Event based discovery failed: {str(e)}. Falling back to label metadata...")
             return self._fetch_label_class_fallback(target_name)
     
     def _fetch_label_class_fallback(self, drug_name: str) -> str:
@@ -220,13 +224,24 @@ class AdverseScoreClient:
         Helper to ensure we do not return any empty string if the event API is noisy.
         '''
         url = "https://api.fda.gov/drug/label.json"
-        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
-        try:
-            res = self.session.get(f"{url}?{query}&api_key={self.api_key}").json()
-            return res['results'][0]['openfda']['pharm_class_epc'][0]
-        except:
-            return ""
+        search_str = f'search=openfda.brand_name:"{drug_name}"'
+        encoded_search = urllib.parse.quote(search_str)
 
+        try:
+            full_url = f"{url}?search={encoded_search}&limit=5&api_key={self.api_key}"
+            res = self.session.get(full_url, timeout=10).json()
+
+            # Final Safety Net: Ban excipients from the fallback
+            ignore_classes = ["Endoglycosidase [EPC]", "Hyaluronidase"]
+            
+            for result in res.get('results', []):
+                epc_list = result.get('openfda', {}).get('pharm_class_epc', [])
+                for epc in epc_list:
+                    if epc not in ignore_classes:
+                        return epc
+            return ""
+        except Exception:
+            return ""
         
     def _discover_peers(self, pharm_class: str, target_drug: str) -> list: # type: ignore
         '''
