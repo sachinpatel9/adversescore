@@ -185,11 +185,12 @@ class AdverseScoreClient:
     
     def _discover_drug_class(self, drug_name: str) -> str:
         '''
-        Queries the FDA label database to find the Established Pharmacologic Class (EPC)
+        Discovers the primary therapeutic class using frequency analysis on historical adverse event data, bypassing label noise
         '''
         url = "https://api.fda.gov/drug/label.json"
         #search by brand or generic name
-        query = f'search=openfda.brand_name:"{drug_name}"+OR+openfda.generic_name:"{drug_name}"&limit=1'
+        clean_name = drug_name.upper().replace(' ', '+')
+        query = f'search=patient.drug.medicinalproduct:"{clean_name}"&count=patient.drug.openfda.pharm_class_epc.exact'
 
         try:
             response = self.session.get(f"{url}?{query}&api_key={self.api_key}",
@@ -197,13 +198,14 @@ class AdverseScoreClient:
             response.raise_for_status()
             data = response.json()
 
-            #extract pharm_class_epc
             results = data.get('results', [])
             if results:
-                openfda_data = results[0].get('openfda', {})
-                epc_list = openfda_data.get('pharm_class_epc', [])
-                if epc_list:
-                    return epc_list[0] #return the primary class
+                primary_class = results[0].get('term')
+                class_volume = results[0].get('count')
+
+                print(f"[Discovery] Algo Ontology Selected: {primary_class} (Historical N={class_volume})")
+                return primary_class
+            
             return ""
         except Exception as e:
             print(f"[Discovery] Failed to identify pharmacology class for {drug_name}.")
@@ -319,7 +321,7 @@ class AdverseScoreClient:
             'defect_ratio': round(quality_defect_ratio, 2),
         }
 
-    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict, prr_metrics: dict = None) -> dict:
+    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict, prr_metrics: dict = None) -> dict: #type: ignore case
         '''
         Generates deterministic boolean flags to control AI behavior
         Prevents hallucination and ensures clinical safety protocols
@@ -375,7 +377,7 @@ class AdverseScoreClient:
 
         try:
             entity = drug_name or pharm_class
-            print(f"[Aggreagation] Running server-side symptom count for {entity}")
+            print(f"[Aggregation] Running server-side symptom count for {entity}")
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             data = response.json()
@@ -539,9 +541,6 @@ class AdverseScoreClient:
         }
 
         return agent_payload
-
-
-    
 
 
 #Quick Exection
