@@ -1,3 +1,4 @@
+import math
 import urllib.parse
 import requests
 from requests.adapters import HTTPAdapter
@@ -318,7 +319,7 @@ class AdverseScoreClient:
             'defect_ratio': round(quality_defect_ratio, 2),
         }
 
-    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict) -> dict:
+    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict, prr_metrics: dict = None) -> dict:
         '''
         Generates deterministic boolean flags to control AI behavior
         Prevents hallucination and ensures clinical safety protocols
@@ -337,6 +338,11 @@ class AdverseScoreClient:
         #specialist routing
         route_to_specialist = adverse_score > 60
 
+        #PRR override
+        if prr_metrics and prr_metrics.get("signal_detected"):
+            requires_human_review = True
+            route_to_specialist = True
+
         return {
             "diagnosis_lock": diagnosis_lock,
             "requires_human_review": requires_human_review,
@@ -344,8 +350,89 @@ class AdverseScoreClient:
             "system_directive": "Halt autonomous clinical advice if requires_human_review is True."
         }
 
+    def _fetch_symptom_counts(self, drug_name: str = None, pharm_class: str = None, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
+        '''
+        Hits the openFDA count endpoint for a specific drug or a pharmacologic class - forces the FDA servers to aggregate symptom frequencies instantly
+        '''
+        query_parts = []
+
+        if drug_name:
+            query_parts.append(f'patient.drug.medicinalproduct:"{drug_name}"')
+        elif pharm_class:
+            clean_class = pharm_class.replace(' ', '+').replace('"', '')
+            query_parts.append(f'patient.drug.openfda.pharm_class_epc:"{clean_class}"')
+        
+        if patient_sex:
+            sex_code = "1" if patient_sex.upper() == "F" else "2"
+            query_parts.append(f'patient.patientsex:{sex_code}')
+        if patient_age:
+            lower = max(0, patient_age - 5)
+            upper = patient_age + 5
+            query_parts.append(f'patient.patientonsetage:[{lower}+TO+{upper}]')
+        
+        search_string = "+AND+".join([q.replace(" ", "+") for q in query_parts])
+        url = f"{self.base_url}?search={search_string}&count=patient.reaction.reactionmeddrapt.exact&limit=1000&api_key={self.api_key}"
+
+        try:
+            entity = drug_name or pharm_class
+            print(f"[Aggreagation] Running server-side symptom count for {entity}")
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            #map symptom named directly to their integer counts
+            return {item['term'].upper(): item['count'] for item in data.get('results', [])}
+        except Exception:
+            return {}
     
-    def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
+    def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
+        '''
+        Executes the PRR ratio calculation and 95% confidence interval math
+        '''
+        drug_counts = self._fetch_symptom_counts(drug_name=drug_name, patient_age=patient_age, patient_sex=patient_sex)
+        class_counts = self._fetch_symptom_counts(pharm_class=pharm_class, patient_age=patient_age, patient_sex=patient_sex)
+
+        symptom_upper = target_symptom.upper()
+
+        #a = target_drug + target_symptom 
+        #a_plus_b = Total Target Drug Symptoms
+        a = drug_counts.get(symptom_upper, 0)
+        a_plus_b = sum(drug_counts.values())
+
+        #c = class + target symptom
+        # #c_plus_d = total class symptoms
+        c = class_counts.get(symptom_upper, 0)
+        c_plus_d = sum(class_counts.values())
+
+        #guard against division by zero or stat insignificant sample size
+        if a < 3 or c == 0 or a_plus_b == 0 or c_plus_d == 0:
+            return {"prr": 0.0, "ci_lower": 0.0, "signal_detected": False, "target_symptom": symptom_upper, "drug_cases": a, "class_cases": c}
+
+        prr = (a / a_plus_b) / (c / c_plus_d)
+
+        try:
+            #95% CI lower bound for PRR
+            se = math.sqrt((1/a) + (1/c) - (1/a_plus_b) - (1/c_plus_d))
+            ci_lower = math.exp(math.log(prr) - 1.96 * se)
+        except ValueError:
+            ci_lower = 0.0
+
+        #Mathematic Guardrail
+        signal_detected = ci_lower > 1.0 and a >= 3
+
+        if signal_detected:
+            print(f"[Math Engine] Stat Signal Detected: {symptom_upper} | PRR: {round(prr,2)} | CI Lower: {round(ci_lower, 2)}")
+
+        return {
+            "prr": round(prr, 2),
+            "ci_lower": round(ci_lower, 2),
+            "signal_detected": signal_detected,
+            "target_symptom": target_symptom,
+            "drug_cases": a,
+            "class_cases": c
+        }    
+
+    
+    def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False, patient_age: int = None, patient_sex: str = None, target_symptom: str = None) -> dict: #type: ignore case
         '''
         Aggregates individual report scores into a final Adverse Score for the drug
         Implements a Recency decay and Normalization logic
@@ -380,6 +467,12 @@ class AdverseScoreClient:
         
         #fetch label text once for this drug to use in the loop 
         label_text = self.fetch_label_text(drug_name)
+
+        prr_metrics = None
+        if target_symptom:
+            pharm_class = self._discover_drug_class(drug_name)
+            if pharm_class:
+                prr_metrics = self._calculate_prr_metrics(drug_name, pharm_class, target_symptom, patient_age, patient_sex)
 
         total_weighted_points = 0
         ninety_days_ago = datetime.now() - timedelta(days=90)
@@ -419,7 +512,7 @@ class AdverseScoreClient:
         confidence_metrics = self._calculate_confidence(clean_reports)
 
         #integrate guardrails
-        guardrails = self._generate_guardrails(final_score, confidence_metrics)
+        guardrails = self._generate_guardrails(final_score, confidence_metrics, prr_metrics)
 
         #integrate the payload schema
         agent_payload = {
@@ -441,6 +534,7 @@ class AdverseScoreClient:
                 "confidence_level": confidence_metrics.get("level"),
                 "defect_ratio": confidence_metrics.get("defect_ratio")
             },
+            "pharmacovigilance_metrics": prr_metrics,
             "agent_directives": guardrails
         }
 
