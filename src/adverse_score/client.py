@@ -19,11 +19,6 @@ class AdverseScoreClient:
         'NON_SERIOUS': 0.25
     }
 
-    PEER_GROUPS = {
-        'KEYTRUDA': ['OPDIVO', 'TECENTRIQ', 'BAVENCIO'],
-        'PEMBROLIZUMAB': ['NIVOLUMAB', 'ATEZOLIZUMAB', 'AVELUMAB']
-    }
-
     def __init__(self):
         self.api_key: str = initialize_config()
         self.session = self._get_transport_session()
@@ -171,18 +166,88 @@ class AdverseScoreClient:
         raw_score = base_weight * penalty
         return raw_score
     
+    def _discover_drug_class(self, drug_name: str) -> str:
+        '''
+        Queries the FDA label database to find the Established Pharmacologic Class (EPC)
+        '''
+        url = "https://api.fda.gov/drug/label.json"
+        #search by brand or generic name
+        query = f'search=openfda.brand_name:"{drug_name}"+OR+openfda.generic_name:"{drug_name}"&limit=1'
+
+        try:
+            response = self.session.get(f"{url}?{query}&api_key={self.api_key}",
+                                        timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            #extract pharm_class_epc
+            results = data.get('results', [])
+            if results:
+                openfda_data = results[0].get('openfda', {})
+                epc_list = openfda_data.get('pharm_class_epc', [])
+                if epc_list:
+                    return epc_list[0] #return the primary class
+            return ""
+        except Exception as e:
+            print(f"[Discovery] Failed to identify pharmacology class for {drug_name}.")
+            return ""
+        
+    def _discover_peers(self, pharm_class: str, target_drug: str) -> list: # type: ignore
+        '''
+        Find the top 3 most prescribed / reported peer drugs in the same pharmacologic class.
+        Uses the openFDA event count endpoint
+        '''
+        if not pharm_class:
+            return []
+        
+        print(f"[Discovery] Pharmacologic Class Identified: {pharm_class}")
+        url = "https://api.fda.gov/drug/event.json"
+
+        #clean the class name for the URL
+        clean_class = pharm_class.replace(' ', '+').replace('"', '')
+        query = f'search=patient.drug.openfda.pharm_class_epc:"{clean_class}"&count=patient.drug.medicinalproduct.exact'
+
+        try:
+            response = self.session.get(f"{url}?{query}&api_key={self.api_key}", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            peers = []
+            target_upper = target_drug.upper()
+
+            #FDA returns a list of terms and counts 
+            for item in data.get('results', []):
+                peer_name = item.get('term', '').upper()
+                #exclude the target drug itself and invalid short names
+                if peer_name and peer_name != target_upper and len(peer_name) > 3:
+                    peers.append(peer_name)
+                if len(peers) >= 3:
+                    break
+            
+            print(f"[Discovery] Top Peers Found: {', '.join(peers)}")
+            return peers
+        
+        except Exception as e:
+            print(f"[Discovery] Failed to find peers for class {pharm_class}.")
+            return []
+
+    
     def get_peer_benchmark(self, drug_name: str) -> float:
         '''
-        Calculates the average AdverseScore of peer drugs
+        Calculates the average AdverseScore of peer drugs using Dynamic Ontology Mapping.
         '''
         target_upper = drug_name.upper()
-        peers = self.PEER_GROUPS.get(target_upper, [])
+
+        #trigger the dynamic discovery
+        pharm_class = self._discover_drug_class(target_upper)
+        peers = self._discover_peers(pharm_class, target_upper)
 
         if not peers:
+            print(f'[Benchmarking] No peers discovered for {drug_name}. Skipping benchmark.')
             return 0.0
         
         peer_scores = []
-        print(f"Benchmarking {drug_name} against peers: {', '.join(peers)}")
+        print(f"[Benchmarking] Evaluating {drug_name} against the discovered peers: {', '.join(peers)}")
 
         for peer in peers:
             raw = self.fetch_events(peer)

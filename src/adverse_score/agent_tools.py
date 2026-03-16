@@ -19,12 +19,12 @@ class ClinicalQuerySchema(BaseModel):
     )
     patient_sex: Optional[str] = Field(
         None,
-        description='The biological sex of the patient, strictly 'M' or 'F', if provided in the prompt.'
+        description="The biological sex of the patient, strictly 'M' or 'F', if provided in the prompt."
     )
 
 #Agent Tool 
 @tool(args_schema=ClinicalQuerySchema)
-def get_adverse_score(drug_name: str, patient_age: int=None, patient_sex: str=None) -> str:
+def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= None) -> str: # type: ignore
     '''
     Calculates a clinial safety risk score (0-100) based on FDA adverse event reports,
     Call this tool when a user asks about the safety, side effects, toxicity, or risk profile of a specific medication.
@@ -33,7 +33,7 @@ def get_adverse_score(drug_name: str, patient_age: int=None, patient_sex: str=No
     print(f"Tool Initiated: Fetching AdverseScore for {drug_name.upper()}")
 
     #Visual confirmation 
-    if patient-age or patient_sex:
+    if patient_age or patient_sex:
         print(f'[Agent Network] Demographics Extracted -> Age: {patient_age}, Sex: {patient_sex}')
     
     try:
@@ -57,5 +57,4 @@ def get_adverse_score(drug_name: str, patient_age: int=None, patient_sex: str=No
             }
         }
         return json.dumps(error_payload)
-    
     
