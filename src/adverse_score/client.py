@@ -5,6 +5,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from .config import initialize_config
+from typing import Optional, List, Dict
 import json
 
 
@@ -321,7 +322,7 @@ class AdverseScoreClient:
             'defect_ratio': round(quality_defect_ratio, 2),
         }
 
-    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict, prr_metrics: dict = None) -> dict: #type: ignore case
+    def _generate_guardrails(self, adverse_score: float, confidence_metrics: dict, prr_metrics: Optional[dict] = None) -> dict:
         '''
         Generates deterministic boolean flags to control AI behavior
         Prevents hallucination and ensures clinical safety protocols
