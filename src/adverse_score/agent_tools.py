@@ -39,7 +39,11 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
     try:
         raw_data = _global_client.fetch_events(drug_name, patient_age, patient_sex)
         clean_list = _global_client._flatten_results(raw_data) if raw_data else []
-        agent_payload = _global_client.calculate_final_score(drug_name, clean_list)
+        agent_payload = _global_client.calculate_final_score(
+            drug_name, 
+            clean_list,
+            patient_age=patient_age,
+            patient_sex=patient_sex)
 
         #Inject the parsed demographics back into the metadata so the UI can see them 
         agent_payload['metadata']['extracted_demographics'] = {

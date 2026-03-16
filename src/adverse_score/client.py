@@ -248,7 +248,7 @@ class AdverseScoreClient:
             return []
 
     
-    def get_peer_benchmark(self, drug_name: str) -> float:
+    def get_peer_benchmark(self, drug_name: str, patient_age: int = None, patient_sex: str = None) -> float: #type: ignore case
         '''
         Calculates the average AdverseScore of peer drugs using Dynamic Ontology Mapping.
         '''
@@ -266,7 +266,8 @@ class AdverseScoreClient:
         print(f"[Benchmarking] Evaluating {drug_name} against the discovered peers: {', '.join(peers)}")
 
         for peer in peers:
-            raw = self.fetch_events(peer)
+            print(f'[Benchmarking] Fetching clinical data for {peer}...')
+            raw = self.fetch_events(peer, patient_age, patient_sex)
             clean = self._flatten_results(raw)
             result = self.calculate_final_score(peer, clean, skip_benchmark=True)
             peer_score = result['clinical_signal']['adverse_score']
@@ -344,7 +345,7 @@ class AdverseScoreClient:
         }
 
     
-    def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False) -> dict:
+    def calculate_final_score(self, drug_name: str, clean_reports: list, skip_benchmark: bool = False, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
         '''
         Aggregates individual report scores into a final Adverse Score for the drug
         Implements a Recency decay and Normalization logic
@@ -406,7 +407,7 @@ class AdverseScoreClient:
         benchmark_avg = 0.0
         relative_risk = 'N/A'
         if not skip_benchmark:
-            benchmark_avg = self.get_peer_benchmark(drug_name)
+            benchmark_avg = self.get_peer_benchmark(drug_name, patient_age, patient_sex)
             if benchmark_avg > 0:
                 relative_risk = 'Average'
                 if final_score > (benchmark_avg * 1.5):
