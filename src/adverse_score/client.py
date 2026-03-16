@@ -190,27 +190,43 @@ class AdverseScoreClient:
         '''
         url = "https://api.fda.gov/drug/label.json"
         #search by brand or generic name
-        clean_name = drug_name.upper().replace(' ', '+')
-        query = f'search=patient.drug.medicinalproduct:"{clean_name}"&count=patient.drug.openfda.pharm_class_epc.exact'
+        target_name = drug_name.upper()
+        
+        query = f'search=(patient.drug.openfda.brand_name:"{target_name}"+OR+patient.drug.openfda.generic_name:"{target_name}")'
+        count_param = "&count=patient.drug.openfda.pharm_class_epc.exact"
 
         try:
-            response = self.session.get(f"{url}?{query}&api_key={self.api_key}",
-                                        timeout=10)
+            full_url = f"{url}?{query}{count_param}&api_key={self.api_key}"
+            print(f"[Discovery] Attempting algorithmic class mapping for {target_name}...")
+
+            response = self.session.get(full_url, timeout=10)
             response.raise_for_status()
             data = response.json()
 
             results = data.get('results', [])
             if results:
                 primary_class = results[0].get('term')
-                class_volume = results[0].get('count')
-
-                print(f"[Discovery] Algo Ontology Selected: {primary_class} (Historical N={class_volume})")
+                count = results[0].get('count')
+                print(f"[Discovery] Class Identified: {primary_class} (N={count})")
                 return primary_class
             
             return ""
-        except Exception as e:
-            print(f"[Discovery] Failed to identify pharmacology class for {drug_name}.")
+        except Exception:
+            print(f"[Discovery] Event based discovery failed. Falling back to label metadata...")
+            return self._fetch_label_class_fallback(target_name)
+    
+    def _fetch_label_class_fallback(self, drug_name: str) -> str:
+        '''
+        Helper to ensure we do not return any empty string if the event API is noisy.
+        '''
+        url = "https://api.fda.gov/drug/label.json"
+        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
+        try:
+            res = self.session.get(f"{url}?{query}&api_key={self.api_key}").json()
+            return res['results'][0]['openfda']['pharm_class_epc'][0]
+        except:
             return ""
+
         
     def _discover_peers(self, pharm_class: str, target_drug: str) -> list: # type: ignore
         '''
