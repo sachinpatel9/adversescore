@@ -37,13 +37,18 @@ class AdverseScoreClient:
         start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
         date_range = f"[{start_date}+TO+{end_date}]"
 
-        #building the search parameters 
-        search_params = f'patient.drug.medicinalproduct:"{drug_name}" AND receivedate:{date_range}'
+        # FIX: Sanitize drug_name before embedding in Lucene query — an unescaped quote
+        # in the name (e.g. a malformed LLM extraction) would break the query syntax.
+        safe_name = self._sanitize_for_query(drug_name)
+        #building the search parameters
+        search_params = f'patient.drug.medicinalproduct:"{safe_name}" AND receivedate:{date_range}'
 
         #Inject Demographic Filters
         if patient_sex:
-            #openFDA sex coding 
-            sex_code = "1" if patient_sex.upper() == "F" else "2"
+            # FIX: openFDA sex codes are 1=Male, 2=Female. The original mapping was
+            # inverted (F→1, M→2), causing all sex-filtered queries to return the
+            # opposite cohort — male reports for female patients and vice versa.
+            sex_code = "2" if patient_sex.upper() == "F" else "1"
             search_params += f' AND patient.patientsex:{sex_code}'
 
         if patient_age:
@@ -56,11 +61,8 @@ class AdverseScoreClient:
 
         return f"search={encoded_search}&limit={limit}"
 
-
-        #clean and encode 
-        encoded_search = search_params.replace(" ", "+")
-
-        return f"search={encoded_search}&limit={limit}"
+    # FIX: Removed unreachable duplicate code block (dead code after an earlier return
+    # statement — lines were left behind from a prior refactor and could never execute).
 
     def _get_transport_session(self):
         '''
@@ -82,19 +84,35 @@ class AdverseScoreClient:
 
         return session
 
+    def _sanitize_for_query(self, value: str) -> str:
+        # FIX: Drug names and class names are interpolated into Lucene quoted strings
+        # (e.g. medicinalproduct:"VALUE"). An unescaped " or \ in the value breaks the
+        # query syntax — or worse, injects arbitrary Lucene clauses. Escape both chars.
+        return value.replace('\\', '\\\\').replace('"', '\\"')
+
     def fetch_events(self, drug_name: str, patient_age: int = None, patient_sex: str = None): # type: ignore
         '''
-        Executes the API call using the query builder and the session
+        Executes the API call using the query builder and the session.
+        Note on pagination: openFDA caps results at limit=1000 and skip+limit<=26000.
+        We fetch 500 reports as a representative sample. The downstream confidence metric
+        accounts for sample size, and the count endpoints used for PRR aggregate server-side
+        with no pagination cap. Fetching all reports is not practical for real-time scoring.
         '''
         query_params = self.build_query(drug_name, patient_age=patient_age, patient_sex=patient_sex)
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
         try:
             response = self.session.get(full_url, timeout=10)
+            # FIX: openFDA returns HTTP 404 when zero results match the query — this is
+            # expected behavior (not a server error). The old code logged "Integration Error"
+            # for this case, which was misleading. Now we distinguish it from real failures.
+            if response.status_code == 404:
+                print(f"[API] No adverse event reports found for {drug_name} in the queried time range.")
+                return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            print(f"Integration Error: Failed to fetch data for {drug_name}. Error: {e}")
+            print(f"[API] HTTP error fetching data for {drug_name}: {e}")
             return None
     
     def _flatten_results(self, raw_data) -> list:
@@ -113,6 +131,13 @@ class AdverseScoreClient:
                 'date': report.get('receivedate'),
                 'severity': 'Serious' if report.get('seriousness') == '1' else 'Non-Serious',
                 'is_death': report.get('seriousnessdeath') == '1',
+                # FIX: Extract the hospitalization flag so _calculate_report_score can
+                # distinguish hospitalization (weight 1.0) from other-serious events
+                # (weight 0.75). Without this field, the OTHER_SERIOUS weight in
+                # SEVERITY_WEIGHTS was unreachable — all serious events got 1.0.
+                # Before fix: a disabling-but-not-hospitalized serious event scored 1.0.
+                # After fix: it correctly scores 0.75 (25% lower).
+                'is_hospitalization': report.get('seriousnesshospitalization') == '1',
                 'symptoms': ", ".join(reactions),
                 'company': report.get('companynumb', 'N/A')
             }
@@ -128,7 +153,10 @@ class AdverseScoreClient:
        
         #openFDA label endpoint
         label_url = 'https://api.fda.gov/drug/label.json'
-        query = f'search=openfda.brand_name:"{drug_name}"&limit=1'
+        # FIX: Sanitize drug_name before embedding in the Lucene query — without this,
+        # a drug name containing a quote character would break the query syntax.
+        safe_name = self._sanitize_for_query(drug_name)
+        query = f'search=openfda.brand_name:"{safe_name}"&limit=1'
 
         try:
             response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
@@ -147,14 +175,23 @@ class AdverseScoreClient:
 
     def calculate_label_penalty(self, symptoms: str, label_text: str, is_serious: bool) -> float:
         '''
-        Apply the penalty factors defined. 
-        Unlabeled + Serious: 2.0x | Unlabeled + Non-Serious: 1.5x | Labeled: 1.0x 
+        Apply the penalty factors defined.
+        Unlabeled + Serious: 2.0x | Unlabeled + Non-Serious: 1.5x | Labeled: 1.0x
         '''
         if not label_text:
             return 2.0 if is_serious else 1.5
-        
+
         #check if any reported symptoms is MISSING from the label text - implementing simple key word matching for now, could be improved with NLP techniques
-        symptom_list = [s.strip().lower() for s in symptoms.split(",")]
+        # FIX: The old code did not filter empty strings from the split result. When
+        # symptoms="" (report has no known reactions), split(",") produces [""]. Since
+        # "" is a substring of every non-empty string, `any("" in label_text ...)` is
+        # always True — so reports with MISSING symptoms were classified as "labeled"
+        # and escaped the penalty entirely. A report with no symptoms tells us nothing
+        # about label status, so it should receive the unlabeled penalty.
+        # Before fix: symptoms="" → penalty 1.0x (always labeled). After fix: → 2.0x/1.5x.
+        symptom_list = [s.strip().lower() for s in symptoms.split(",") if s.strip()]
+        if not symptom_list:
+            return 2.0 if is_serious else 1.5
         is_labeled = any(s in label_text for s in symptom_list)
 
         if not is_labeled:
@@ -170,12 +207,18 @@ class AdverseScoreClient:
         is_serious = report.get('severity') == 'Serious'
         symptoms = report.get('symptoms', '')
 
-        #check specific FDA flags for the higher 'Death' weight
+        # FIX: The old code only checked is_death and is_serious, making the
+        # OTHER_SERIOUS weight (0.75) unreachable — every serious non-death event
+        # got HOSPITALIZATION weight (1.0). Now we check is_hospitalization to select
+        # the correct tier. Before fix: a serious disabling event scored 1.0 * penalty.
+        # After fix: it correctly scores 0.75 * penalty (OTHER_SERIOUS).
         base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
         if report.get('is_death'):
             base_weight = self.SEVERITY_WEIGHTS['DEATH']
-        elif is_serious:
+        elif is_serious and report.get('is_hospitalization'):
             base_weight = self.SEVERITY_WEIGHTS['HOSPITALIZATION']
+        elif is_serious:
+            base_weight = self.SEVERITY_WEIGHTS['OTHER_SERIOUS']
 
         #Apply label awareness penalty
         penalty = self.calculate_label_penalty(symptoms, label_text, is_serious)
@@ -193,7 +236,12 @@ class AdverseScoreClient:
         target_name = drug_name.upper()
         
         #build the clean search string
-        search_str = f'patient.drug.openfda.brand_name:"{target_name}"'
+        # FIX: Sanitize drug name before embedding in Lucene query — same pattern applied
+        # to build_query, fetch_label_text, _fetch_label_class_fallback, and
+        # _fetch_symptom_counts. Without this, a drug name containing " would break the
+        # quoted string and corrupt or inject into the Lucene query.
+        safe_name = self._sanitize_for_query(target_name)
+        search_str = f'patient.drug.openfda.brand_name:"{safe_name}"'
 
         #safely encode the url to prevent 400 request errors
         encoded_search = urllib.parse.quote(search_str)
@@ -224,12 +272,27 @@ class AdverseScoreClient:
         Helper to ensure we do not return any empty string if the event API is noisy.
         '''
         url = "https://api.fda.gov/drug/label.json"
-        search_str = f'search=openfda.brand_name:"{drug_name}"'
-        encoded_search = urllib.parse.quote(search_str)
+        # FIX: The old code built search_str with a 'search=' prefix, then URL-encoded the
+        # entire string (including the prefix), then placed it after '?search=' in the URL.
+        # This produced a double-prefixed, over-encoded URL like:
+        #   ?search=search%3Dopenfda.brand_name%3A%22DRUG%22
+        # which openFDA cannot parse. Now we encode only the search value (not the key),
+        # matching the pattern used by _discover_drug_class.
+        safe_name = self._sanitize_for_query(drug_name)
+        search_value = f'openfda.brand_name:"{safe_name}"'
+        encoded_search = urllib.parse.quote(search_value)
 
         try:
             full_url = f"{url}?search={encoded_search}&limit=5&api_key={self.api_key}"
-            res = self.session.get(full_url, timeout=10).json()
+            # FIX: The old code called .json() directly on the response without checking
+            # the status code. A non-200 response with a non-JSON body (e.g. an HTML error
+            # page from a gateway) would crash with a JSONDecodeError instead of being
+            # caught by the outer except block.
+            response = self.session.get(full_url, timeout=10)
+            if response.status_code == 404:
+                return ""
+            response.raise_for_status()
+            res = response.json()
 
             # Final Safety Net: Ban excipients from the fallback
             ignore_classes = ["Endoglycosidase [EPC]", "Hyaluronidase"]
@@ -304,6 +367,14 @@ class AdverseScoreClient:
             print(f'[Benchmarking] Fetching clinical data for {peer}...')
             raw = self.fetch_events(peer, patient_age, patient_sex)
             clean = self._flatten_results(raw)
+            # FIX: Skip peers with no adverse event data. Including them assigns a
+            # score of 0.0 (from the "Incomplete Data" early return), which drags the
+            # benchmark average down and makes the target drug appear "Elevated vs
+            # Class Peers" even when its score is normal. Only peers with actual
+            # reports provide meaningful benchmark comparisons.
+            if not clean:
+                print(f'[Benchmarking] No data for peer {peer}, excluding from benchmark.')
+                continue
             result = self.calculate_final_score(peer, clean, skip_benchmark=True)
             peer_score = result['clinical_signal']['adverse_score']
             peer_scores.append(peer_score)
@@ -319,12 +390,15 @@ class AdverseScoreClient:
         if total_reports == 0:
             return {'level': 'None', 'metric': 0.0, 'defect_ratio': 0.0}
         
-        #Volume Assessment
+        # METHODOLOGY NOTE: This is a step function with sharp discontinuities:
+        # 49 reports → 40.0, 50 reports → 90.0 (a 50-point jump for +1 report).
+        # A continuous function like min(100, N * 1.25) or a log curve would avoid
+        # this cliff effect. The current thresholds are empirically chosen.
         if total_reports >= 80:
             base_confidence = 100.0
         elif total_reports >= 50:
             base_confidence = 90.0
-        else: 
+        else:
             base_confidence = 40.0
         
         #Quality Assessment
@@ -391,13 +465,18 @@ class AdverseScoreClient:
         query_parts = []
 
         if drug_name:
-            query_parts.append(f'patient.drug.medicinalproduct:"{drug_name}"')
+            # FIX: Sanitize drug_name to prevent Lucene query injection (same pattern
+            # applied to build_query and fetch_label_text).
+            safe_name = self._sanitize_for_query(drug_name)
+            query_parts.append(f'patient.drug.medicinalproduct:"{safe_name}"')
         elif pharm_class:
             clean_class = pharm_class.replace(' ', '+').replace('"', '')
             query_parts.append(f'patient.drug.openfda.pharm_class_epc:"{clean_class}"')
-        
+
         if patient_sex:
-            sex_code = "1" if patient_sex.upper() == "F" else "2"
+            # FIX: Sex codes were inverted — same bug as build_query. openFDA defines
+            # 1=Male, 2=Female. The old code mapped F→1 (Male) and M→2 (Female).
+            sex_code = "2" if patient_sex.upper() == "F" else "1"
             query_parts.append(f'patient.patientsex:{sex_code}')
         if patient_age:
             lower = max(0, patient_age - 5)
@@ -413,14 +492,35 @@ class AdverseScoreClient:
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             data = response.json()
-            #map symptom named directly to their integer counts
-            return {item['term'].upper(): item['count'] for item in data.get('results', [])}
+            # FIX: The old code used direct dict access (item['term'], item['count']) which
+            # throws KeyError if openFDA returns a result item missing either field. This
+            # crashes the entire dict comprehension. Using .get() with a skip guard handles
+            # malformed items gracefully instead of aborting the whole aggregation.
+            counts = {}
+            for item in data.get('results', []):
+                term = item.get('term')
+                count = item.get('count')
+                if term is not None and count is not None:
+                    counts[term.upper()] = count
+            return counts
         except Exception:
             return {}
     
     def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
         '''
-        Executes the PRR ratio calculation and 95% confidence interval math
+        Executes the PRR ratio calculation and 95% confidence interval math.
+
+        METHODOLOGY NOTE (pharmacovigilance deviation from Evans et al., 2001):
+        1. The classical PRR comparator is "all OTHER drugs" (excluding the target).
+           This implementation uses "all drugs in the same pharmacologic class" which
+           INCLUDES the target drug in the denominator. When the class has many drugs
+           the impact is small, but for small classes this dilutes the signal.
+        2. The denominators (a+b, c+d) are total symptom MENTION counts from the
+           openFDA count endpoint, not total REPORT counts. Since a single report can
+           list multiple symptoms, this inflates the denominators and slightly deflates
+           the PRR vs. the classical report-level formulation.
+        Both are accepted simplifications in automated signal detection systems where
+        individual report-level 2x2 tables are impractical to construct from the API.
         '''
         drug_counts = self._fetch_symptom_counts(drug_name=drug_name, patient_age=patient_age, patient_sex=patient_sex)
         class_counts = self._fetch_symptom_counts(pharm_class=pharm_class, patient_age=patient_age, patient_sex=patient_sex)
@@ -444,7 +544,11 @@ class AdverseScoreClient:
         prr = (a / a_plus_b) / (c / c_plus_d)
 
         try:
-            #95% CI lower bound for PRR
+            # 95% CI lower bound for log-transformed PRR (Wald method).
+            # SE(ln(PRR)) = sqrt(1/a - 1/(a+b) + 1/c - 1/(c+d))
+            # The radicand is always >= 0 because each pair (1/x - 1/(x+y)) = y/(x*(x+y)) >= 0
+            # given the guards above ensure a,c > 0 and a<=a+b, c<=c+d. The ValueError
+            # catch below is a defensive fallback that should never trigger in practice.
             se = math.sqrt((1/a) + (1/c) - (1/a_plus_b) - (1/c_plus_d))
             ci_lower = math.exp(math.log(prr) - 1.96 * se)
         except ValueError:
@@ -495,7 +599,7 @@ class AdverseScoreClient:
                     "diagnosis_lock": True,
                     "requires_human_review": False,
                     "route_to_specialist": False,
-                    "system_directive": "Inform the user that insufficient safety data exists in the openFDA database for this drug. Do not attempt to calculate a risk profile."
+                    "system_directive": "Inform the user that insufficient safety data exists in the openFDA database for this drug. Suggest they verify the drug name spelling and try the exact brand or generic name. Do not attempt to calculate a risk profile."
                 }
             }
         
@@ -518,11 +622,22 @@ class AdverseScoreClient:
                 report_date = datetime.strptime(report['date'], "%Y%m%d")
                 decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
             except (ValueError, TypeError):
+                # METHODOLOGY NOTE: Reports with missing or unparseable dates default to
+                # full recency weight (1.0). This means low-quality reports (which the
+                # confidence metric separately penalizes) are treated as maximally recent,
+                # slightly inflating the score. An alternative would be 0.5 (assume old)
+                # or 0.75 (neutral). The current choice errs toward surfacing signals.
                 decay_multiplier = 1.0
             
             total_weighted_points += (report_score * decay_multiplier)
         
         mean_signal = total_weighted_points / len(clean_reports)
+        # METHODOLOGY NOTE: The x40 scalar maps the mean weighted signal into a 0-100
+        # range. The theoretical max mean_signal is 1.75 * 2.0 * 1.0 = 3.5 (all death
+        # + unlabeled + recent), yielding 3.5 * 40 = 140, capped to 100. The theoretical
+        # min for a non-empty dataset is 0.25 * 1.0 * 0.5 = 0.125 (all non-serious +
+        # labeled + old), yielding 0.125 * 40 = 5.0. This scalar is empirically chosen
+        # and not derived from a statistical model.
         final_score = min(100, round(mean_signal * 40, 2))
 
         #Add f-string formatting

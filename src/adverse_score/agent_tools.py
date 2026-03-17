@@ -1,6 +1,6 @@
 import json
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Optional, Literal
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from langchain_core.tools import tool
 from .client import AdverseScoreClient
 
@@ -9,22 +9,52 @@ _global_client = AdverseScoreClient()
 
 #Strict Extraction Schema (Pydantic)
 class ClinicalQuerySchema(BaseModel):
+    # FIX: extra="forbid" rejects unexpected fields at validation time.
+    # Without this, the model silently accepts arbitrary extra keys — inappropriate for a clinical tool.
+    model_config = ConfigDict(extra="forbid")
+
+    # FIX: Added min_length=1 — an empty string "" would produce a broken FDA Lucene query
+    # (e.g. patient.drug.medicinalproduct:""), returning unpredictable results.
     drug_name: str = Field(
         ...,
+        min_length=1,
         description="The exact brand or generic name of the target drug (ex. KEYTRUDA, OZEMPIC)."
     )
+    # FIX: Added ge=1, le=120 — negative ages or ages > 120 produce nonsensical FDA age
+    # cohort brackets. ge=1 (not ge=0) because downstream client.py uses `if patient_age:`
+    # truthiness checks, so age=0 would silently skip the filter. Known limitation for neonates.
     patient_age: Optional[int] = Field(
         None,
-        description='The exact age of the patient in years, if provided in the prompt.'
+        ge=1,
+        le=120,
+        description='The exact age of the patient in years (1-120), if provided in the prompt.'
     )
-    patient_sex: Optional[str] = Field(
+    # FIX: Changed Optional[str] to Optional[Literal["M", "F"]] — the old type accepted any
+    # string, and client.py:46 silently maps anything that isn't "F" to male (sex code "2").
+    # Literal emits an enum constraint in the JSON schema so the LLM produces valid values.
+    patient_sex: Optional[Literal["M", "F"]] = Field(
         None,
         description="The biological sex of the patient, strictly 'M' or 'F', if provided in the prompt."
     )
+    # FIX: Added min_length=1 — a whitespace-only string like " " is truthy, so it passes
+    # the downstream `if target_symptom:` guard but .upper() yields " " which never matches
+    # any symptom key in the PRR count dicts, producing a silent zero-result.
     target_symptom: Optional[str] = Field(
         None,
+        min_length=1,
         description="The specific adverse event, side effect, or symptom to analyze (eg. 'pancreatitis', 'fatigue') if provided."
     )
+
+    # FIX: Strips leading/trailing whitespace from drug_name. Untrimmed names produce
+    # malformed FDA Lucene queries (e.g. medicinalproduct:" KEYTRUDA "). Also rejects
+    # whitespace-only strings that pass min_length=1 but are semantically empty.
+    @field_validator("drug_name")
+    @classmethod
+    def normalize_drug_name(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("drug_name must not be blank after stripping whitespace")
+        return stripped
 
 #Agent Tool 
 @tool(args_schema=ClinicalQuerySchema)
@@ -63,10 +93,21 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
         return json.dumps(agent_payload)
 
     except Exception as e:
+        # FIX: The old error payload was missing clinical_disclaimer (violating the
+        # system prompt's Rule 5), diagnosis_lock, and requires_human_review (making
+        # Rules 1-2 uncheckable). The LLM either hallucinated these fields or silently
+        # omitted the disclaimer, producing inconsistent error responses.
         error_payload = {
-            'metadata': {'tool_name': 'AdverseScore', 'status': 'System Error'},
+            'metadata': {
+                'tool_name': 'AdverseScore',
+                'status': 'System Error',
+                'clinical_disclaimer': 'This tool is for informational purposes only and does not constitute medical advice.'
+            },
             'agent_directives': {
-                'system_directive': f'Inform the user that the AdverseScore tool is currently unavailable. Internal Error: {str(e)}'
+                'diagnosis_lock': True,
+                'requires_human_review': False,
+                'route_to_specialist': False,
+                'system_directive': f'Inform the user that the AdverseScore tool encountered a system error and could not complete the analysis. Internal Error: {str(e)}'
             }
         }
         return json.dumps(error_payload)

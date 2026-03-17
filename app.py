@@ -9,7 +9,7 @@ if src_path not in sys.path:
 
 import streamlit as st
 from adverse_score.orchestrator import agent_executor
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 #UI Configuration
 st.set_page_config(page_title="AdverseScore Clinical AI", page_icon="⚕️", layout='centered')
@@ -56,8 +56,30 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
     with st.chat_message('assistant'):
         with st.spinner('Executing clinical scoring and peer benchmarking...'):
             try:
-                #triggering the LangGraph agent
-                response = agent_executor.invoke({'messages': [HumanMessage(content=prompt)]})
+                # FIX: The default recursion_limit for create_agent is 10,000 — effectively
+                # unlimited. Each LLM→tool→LLM cycle uses ~3 graph steps, so 10,000 steps
+                # allows ~3,333 tool calls. For this agent (single tool, one call per request),
+                # recursion_limit=10 allows up to ~3 tool calls which covers the normal flow
+                # (1 call) plus buffer for edge cases, while preventing runaway loops that
+                # would burn API credits and hang the UI indefinitely.
+
+                # FIX: The old code sent only the current message, making the agent
+                # stateless — it couldn't handle follow-ups like "now compare to
+                # ibuprofen" because it had no memory of the previous drug analyzed.
+                # Now we pass the full conversation history so the agent can reference
+                # prior turns. The system prompt's SCOPE ENFORCEMENT and TOOL PROTOCOL
+                # rules still apply per-turn.
+                history = []
+                for msg in st.session_state.messages:
+                    if msg['role'] == 'user':
+                        history.append(HumanMessage(content=msg['content']))
+                    elif msg['role'] == 'assistant':
+                        history.append(AIMessage(content=msg['content']))
+                history.append(HumanMessage(content=prompt))
+                response = agent_executor.invoke(
+                    {'messages': history},
+                    config={'recursion_limit': 10}
+                )
                 output = response['messages'][-1].content
                 st.markdown(output)
                 st.session_state.messages.append({'role': 'assistant', 'content': output})
