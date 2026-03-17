@@ -732,11 +732,30 @@ class TestOrchestratorWiring:
         assert "do not retry" in system_instructions.lower()
 
     def test_system_prompt_contains_response_format(self):
-        """System prompt includes the 7-section RESPONSE FORMAT specification."""
+        """System prompt includes the 9-section RESPONSE FORMAT specification."""
         from adverse_score.orchestrator import system_instructions
         assert "RESPONSE FORMAT" in system_instructions
         assert "Drug name and AdverseScore" in system_instructions
         assert "Clinical disclaimer" in system_instructions
+
+    def test_system_prompt_contains_score_rationale(self):
+        """System prompt includes mandatory Score Rationale section in RESPONSE FORMAT."""
+        from adverse_score.orchestrator import system_instructions
+        # Normalize whitespace for multi-line matching
+        normalized = " ".join(system_instructions.lower().split())
+        assert "score rationale" in normalized
+        assert "mandatory" in normalized
+        assert "signals most influenced" in normalized
+        assert "PRR" in system_instructions
+        assert "peer benchmark" in normalized
+        assert "confidence caveats" in normalized
+
+    def test_system_prompt_reasoning_leads_with_significant_signal(self):
+        """REASONING PROTOCOL instructs the LLM to lead Score Rationale with the most significant signal."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "most clinically significant signal" in normalized
+        assert "do not bury" in normalized
 
 
 class TestPayloadStructure:

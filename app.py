@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 from pathlib import Path
 
 #pointing python to 'srs' directory
@@ -134,7 +135,24 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                     config={'recursion_limit': 10}
                 )
                 output = response['messages'][-1].content
-                st.markdown(output)
+                # Extract Score Rationale section for expander rendering
+                rationale_match = re.search(
+                    r'(?:#{1,3}\s*\**Score Rationale\**|(?:\d+\.\s*)?\**Score Rationale\**)'
+                    r'[:\s—-]*\n(.*?)(?=\n#{1,3}\s|\n\d+\.\s\**[A-Z]|\Z)',
+                    output, re.DOTALL | re.IGNORECASE
+                )
+                if rationale_match:
+                    rationale_text = rationale_match.group(1).strip()
+                    # Render main output without the rationale section
+                    main_output = output[:rationale_match.start()].rstrip()
+                    remainder = output[rationale_match.end():].lstrip('\n')
+                    st.markdown(main_output)
+                    with st.expander("Score Rationale", expanded=True):
+                        st.markdown(rationale_text)
+                    if remainder:
+                        st.markdown(remainder)
+                else:
+                    st.markdown(output)
                 st.session_state.messages.append({'role': 'assistant', 'content': output})
             except Exception as e:
                 st.error(f"System Error: {str(e)}")
