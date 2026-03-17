@@ -37,7 +37,7 @@ class AdverseScoreClient:
         start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
         date_range = f"[{start_date}+TO+{end_date}]"
 
-        # FIX: Sanitize drug_name before embedding in Lucene query — an unescaped quote
+        # Sanitize drug_name before embedding in Lucene query — an unescaped quote
         # in the name (e.g. a malformed LLM extraction) would break the query syntax.
         safe_name = self._sanitize_for_query(drug_name)
         #building the search parameters
@@ -45,9 +45,6 @@ class AdverseScoreClient:
 
         #Inject Demographic Filters
         if patient_sex:
-            # FIX: openFDA sex codes are 1=Male, 2=Female. The original mapping was
-            # inverted (F→1, M→2), causing all sex-filtered queries to return the
-            # opposite cohort — male reports for female patients and vice versa.
             sex_code = "2" if patient_sex.upper() == "F" else "1"
             search_params += f' AND patient.patientsex:{sex_code}'
 
@@ -60,9 +57,6 @@ class AdverseScoreClient:
         encoded_search = search_params.replace(" ", "+")
 
         return f"search={encoded_search}&limit={limit}"
-
-    # FIX: Removed unreachable duplicate code block (dead code after an earlier return
-    # statement — lines were left behind from a prior refactor and could never execute).
 
     def _get_transport_session(self):
         '''
@@ -85,9 +79,7 @@ class AdverseScoreClient:
         return session
 
     def _sanitize_for_query(self, value: str) -> str:
-        # FIX: Drug names and class names are interpolated into Lucene quoted strings
-        # (e.g. medicinalproduct:"VALUE"). An unescaped " or \ in the value breaks the
-        # query syntax — or worse, injects arbitrary Lucene clauses. Escape both chars.
+        # Drug names and class names are interpolated into Lucene quoted strings
         return value.replace('\\', '\\\\').replace('"', '\\"')
 
     def fetch_events(self, drug_name: str, patient_age: int = None, patient_sex: str = None): # type: ignore
@@ -103,9 +95,6 @@ class AdverseScoreClient:
 
         try:
             response = self.session.get(full_url, timeout=10)
-            # FIX: openFDA returns HTTP 404 when zero results match the query — this is
-            # expected behavior (not a server error). The old code logged "Integration Error"
-            # for this case, which was misleading. Now we distinguish it from real failures.
             if response.status_code == 404:
                 print(f"[API] No adverse event reports found for {drug_name} in the queried time range.")
                 return None
@@ -131,12 +120,6 @@ class AdverseScoreClient:
                 'date': report.get('receivedate'),
                 'severity': 'Serious' if report.get('seriousness') == '1' else 'Non-Serious',
                 'is_death': report.get('seriousnessdeath') == '1',
-                # FIX: Extract the hospitalization flag so _calculate_report_score can
-                # distinguish hospitalization (weight 1.0) from other-serious events
-                # (weight 0.75). Without this field, the OTHER_SERIOUS weight in
-                # SEVERITY_WEIGHTS was unreachable — all serious events got 1.0.
-                # Before fix: a disabling-but-not-hospitalized serious event scored 1.0.
-                # After fix: it correctly scores 0.75 (25% lower).
                 'is_hospitalization': report.get('seriousnesshospitalization') == '1',
                 'symptoms': ", ".join(reactions),
                 'company': report.get('companynumb', 'N/A')
@@ -149,12 +132,9 @@ class AdverseScoreClient:
         Retrieves official FDA 'Adverse Reactions' text
         Used to identify 'Unlabeled vs Labeled signals
         '''
-        
-       
         #openFDA label endpoint
         label_url = 'https://api.fda.gov/drug/label.json'
-        # FIX: Sanitize drug_name before embedding in the Lucene query — without this,
-        # a drug name containing a quote character would break the query syntax.
+
         safe_name = self._sanitize_for_query(drug_name)
         query = f'search=openfda.brand_name:"{safe_name}"&limit=1'
 
@@ -181,14 +161,6 @@ class AdverseScoreClient:
         if not label_text:
             return 2.0 if is_serious else 1.5
 
-        #check if any reported symptoms is MISSING from the label text - implementing simple key word matching for now, could be improved with NLP techniques
-        # FIX: The old code did not filter empty strings from the split result. When
-        # symptoms="" (report has no known reactions), split(",") produces [""]. Since
-        # "" is a substring of every non-empty string, `any("" in label_text ...)` is
-        # always True — so reports with MISSING symptoms were classified as "labeled"
-        # and escaped the penalty entirely. A report with no symptoms tells us nothing
-        # about label status, so it should receive the unlabeled penalty.
-        # Before fix: symptoms="" → penalty 1.0x (always labeled). After fix: → 2.0x/1.5x.
         symptom_list = [s.strip().lower() for s in symptoms.split(",") if s.strip()]
         if not symptom_list:
             return 2.0 if is_serious else 1.5
@@ -207,11 +179,6 @@ class AdverseScoreClient:
         is_serious = report.get('severity') == 'Serious'
         symptoms = report.get('symptoms', '')
 
-        # FIX: The old code only checked is_death and is_serious, making the
-        # OTHER_SERIOUS weight (0.75) unreachable — every serious non-death event
-        # got HOSPITALIZATION weight (1.0). Now we check is_hospitalization to select
-        # the correct tier. Before fix: a serious disabling event scored 1.0 * penalty.
-        # After fix: it correctly scores 0.75 * penalty (OTHER_SERIOUS).
         base_weight = self.SEVERITY_WEIGHTS['NON_SERIOUS']
         if report.get('is_death'):
             base_weight = self.SEVERITY_WEIGHTS['DEATH']
@@ -234,12 +201,6 @@ class AdverseScoreClient:
         url = "https://api.fda.gov/drug/event.json"
         #search by brand or generic name
         target_name = drug_name.upper()
-        
-        #build the clean search string
-        # FIX: Sanitize drug name before embedding in Lucene query — same pattern applied
-        # to build_query, fetch_label_text, _fetch_label_class_fallback, and
-        # _fetch_symptom_counts. Without this, a drug name containing " would break the
-        # quoted string and corrupt or inject into the Lucene query.
         safe_name = self._sanitize_for_query(target_name)
         search_str = f'patient.drug.openfda.brand_name:"{safe_name}"'
 
@@ -272,22 +233,12 @@ class AdverseScoreClient:
         Helper to ensure we do not return any empty string if the event API is noisy.
         '''
         url = "https://api.fda.gov/drug/label.json"
-        # FIX: The old code built search_str with a 'search=' prefix, then URL-encoded the
-        # entire string (including the prefix), then placed it after '?search=' in the URL.
-        # This produced a double-prefixed, over-encoded URL like:
-        #   ?search=search%3Dopenfda.brand_name%3A%22DRUG%22
-        # which openFDA cannot parse. Now we encode only the search value (not the key),
-        # matching the pattern used by _discover_drug_class.
         safe_name = self._sanitize_for_query(drug_name)
         search_value = f'openfda.brand_name:"{safe_name}"'
         encoded_search = urllib.parse.quote(search_value)
 
         try:
             full_url = f"{url}?search={encoded_search}&limit=5&api_key={self.api_key}"
-            # FIX: The old code called .json() directly on the response without checking
-            # the status code. A non-200 response with a non-JSON body (e.g. an HTML error
-            # page from a gateway) would crash with a JSONDecodeError instead of being
-            # caught by the outer except block.
             response = self.session.get(full_url, timeout=10)
             if response.status_code == 404:
                 return ""
@@ -367,11 +318,6 @@ class AdverseScoreClient:
             print(f'[Benchmarking] Fetching clinical data for {peer}...')
             raw = self.fetch_events(peer, patient_age, patient_sex)
             clean = self._flatten_results(raw)
-            # FIX: Skip peers with no adverse event data. Including them assigns a
-            # score of 0.0 (from the "Incomplete Data" early return), which drags the
-            # benchmark average down and makes the target drug appear "Elevated vs
-            # Class Peers" even when its score is normal. Only peers with actual
-            # reports provide meaningful benchmark comparisons.
             if not clean:
                 print(f'[Benchmarking] No data for peer {peer}, excluding from benchmark.')
                 continue
@@ -465,7 +411,6 @@ class AdverseScoreClient:
         query_parts = []
 
         if drug_name:
-            # FIX: Sanitize drug_name to prevent Lucene query injection (same pattern
             # applied to build_query and fetch_label_text).
             safe_name = self._sanitize_for_query(drug_name)
             query_parts.append(f'patient.drug.medicinalproduct:"{safe_name}"')
@@ -474,7 +419,6 @@ class AdverseScoreClient:
             query_parts.append(f'patient.drug.openfda.pharm_class_epc:"{clean_class}"')
 
         if patient_sex:
-            # FIX: Sex codes were inverted — same bug as build_query. openFDA defines
             # 1=Male, 2=Female. The old code mapped F→1 (Male) and M→2 (Female).
             sex_code = "2" if patient_sex.upper() == "F" else "1"
             query_parts.append(f'patient.patientsex:{sex_code}')
@@ -492,7 +436,6 @@ class AdverseScoreClient:
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             data = response.json()
-            # FIX: The old code used direct dict access (item['term'], item['count']) which
             # throws KeyError if openFDA returns a result item missing either field. This
             # crashes the entire dict comprehension. Using .get() with a skip guard handles
             # malformed items gracefully instead of aborting the whole aggregation.
