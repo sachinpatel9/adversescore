@@ -14,29 +14,80 @@ from langchain_core.messages import HumanMessage, AIMessage
 #UI Configuration
 st.set_page_config(page_title="AdverseScore Clinical AI", page_icon="⚕️", layout='centered')
 
-#Styling
+#Styling — Design System
 st.markdown("""
     <style>
-    /* Hide default Streamlit elements */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Vertically center the main content and constrain width */
+    /* ── Design System Variables ── */
+    :root {
+        --color-primary: #1a73e8;
+        --color-bg: #ffffff;
+        --color-text: #1f2937;
+        --color-text-muted: #6b7280;
+        --color-border: #e5e7eb;
+        --color-surface: #f8f9fa;
+        --font-family: 'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        --radius: 8px;
+        --shadow-card: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+    }
+
+    /* ── Strip ALL Streamlit branding ── */
+    #MainMenu, footer, header,
+    .stDeployButton,
+    [data-testid="stDecoration"],
+    [data-testid="stHeader"] {
+        display: none !important;
+    }
+
+    /* ── Global Typography ── */
+    html, body, [class*="css"] {
+        font-family: var(--font-family) !important;
+    }
+
+    /* ── Page Layout ── */
     .block-container {
-        padding-top: 10vh;
-        padding-bottom: 5vh;
-        max-width: 750px;
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 780px;
+    }
+
+    /* ── Branded Header Bar ── */
+    .header-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.75rem 0;
+        border-bottom: 1px solid var(--color-border);
+        margin-bottom: 1.5rem;
+    }
+    .header-bar .logo {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: var(--color-text);
+        letter-spacing: -0.02em;
+    }
+    .header-bar .logo-accent {
+        color: var(--color-primary);
+    }
+    .header-bar .tagline {
+        font-size: 0.78rem;
+        color: var(--color-text-muted);
+        margin-left: auto;
+    }
+
+    /* ── Chat Styling ── */
+    [data-testid="stChatMessage"] {
+        border-radius: var(--radius);
     }
     </style>
 """, unsafe_allow_html=True)
 
-# typographic centering 
-# Using HTML instead of st.title to force center alignment
-st.markdown("<h1 style='text-align: center;'>⚕️ AdverseScore</h1>", unsafe_allow_html=True)
-st.markdown("<h4 style='text-align: center; color: #6c757d; margin-top: -10px;'>Clinical Decision Support Agent</h4>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; font-size: 0.85em; color: gray;'>v1.0-MVP | Powered by openFDA & LangGraph</p>", unsafe_allow_html=True)
-st.markdown("---")
+# Branded header bar
+st.markdown("""
+<div class="header-bar">
+    <div class="logo"><span class="logo-accent">Adverse</span>Score</div>
+    <div class="tagline">Clinical Decision Support &middot; v1.0</div>
+</div>
+""", unsafe_allow_html=True)
 
 #session state for persistent conversation
 if 'messages' not in st.session_state:
@@ -69,13 +120,15 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                 # Now we pass the full conversation history so the agent can reference
                 # prior turns. The system prompt's SCOPE ENFORCEMENT and TOOL PROTOCOL
                 # rules still apply per-turn.
+                # Build history from session state. The current prompt was already
+                # appended to st.session_state.messages above (line 103), so the
+                # loop below includes it — no need to append it again.
                 history = []
                 for msg in st.session_state.messages:
                     if msg['role'] == 'user':
                         history.append(HumanMessage(content=msg['content']))
                     elif msg['role'] == 'assistant':
                         history.append(AIMessage(content=msg['content']))
-                history.append(HumanMessage(content=prompt))
                 response = agent_executor.invoke(
                     {'messages': history},
                     config={'recursion_limit': 10}
