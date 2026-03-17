@@ -793,6 +793,124 @@ class TestOrchestratorWiring:
         assert "lead with unlabeled signals" in normalized
 
 
+class TestSignalNarrativeProtocol:
+    """Tests for the Signal Narrative Generator (Priority 3)."""
+
+    # ── System prompt tests ──
+
+    def test_system_prompt_contains_narrative_protocol(self):
+        """System prompt includes NARRATIVE GENERATION PROTOCOL with all six ICH E2E headings."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "narrative generation protocol" in normalized
+        for heading in [
+            "signal description",
+            "data source and method",
+            "statistical analysis summary",
+            "clinical assessment",
+            "data limitations",
+            "recommendation",
+        ]:
+            assert heading in normalized, f"Missing ICH E2E heading: {heading}"
+
+    def test_system_prompt_narrative_keywords_listed(self):
+        """System prompt lists all trigger keywords for narrative generation."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        for keyword in ["write", "narrative", "document", "report", "summarise", "summarize", "memo", "draft"]:
+            assert keyword in normalized, f"Missing trigger keyword: {keyword}"
+
+    def test_system_prompt_narrative_grounding_rule(self):
+        """System prompt encourages clinical interpretation while requiring validation flags."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "requires clinical validation" in normalized
+        assert "clinical interpretation is encouraged" in normalized
+
+    def test_system_prompt_narrative_draft_header(self):
+        """System prompt requires DRAFT header on narratives."""
+        from adverse_score.orchestrator import system_instructions
+        assert "DRAFT" in system_instructions
+        assert "For Human Review Only" in system_instructions
+
+    # ── Regex extraction tests ──
+
+    def test_narrative_regex_extracts_valid_narrative(self, sample_narrative_output):
+        """Regex extracts narrative body from markers and strips it from main output."""
+        import re
+        narrative_match = re.search(
+            r'<!-- SIGNAL_NARRATIVE_START -->\s*(.*?)\s*<!-- SIGNAL_NARRATIVE_END -->',
+            sample_narrative_output, re.DOTALL
+        )
+        assert narrative_match is not None
+        narrative_text = narrative_match.group(1).strip()
+        assert "DRAFT" in narrative_text
+        assert "Signal Description" in narrative_text
+        # Main output should not contain the narrative after stripping
+        main_output = sample_narrative_output[:narrative_match.start()].rstrip()
+        assert "<!-- SIGNAL_NARRATIVE_START -->" not in main_output
+        assert "Some standard analysis content here" in main_output
+
+    def test_narrative_regex_no_match_without_markers(self):
+        """Standard response without narrative markers returns no match."""
+        import re
+        standard_output = "## Drug Analysis\n\nAdverseScore: 45/100\n\nSome analysis."
+        narrative_match = re.search(
+            r'<!-- SIGNAL_NARRATIVE_START -->\s*(.*?)\s*<!-- SIGNAL_NARRATIVE_END -->',
+            standard_output, re.DOTALL
+        )
+        assert narrative_match is None
+
+    # ── Keyword detection tests ──
+
+    def test_keyword_detection_positive(self):
+        """message_requests_narrative returns True for documentation-intent messages."""
+        sys.path.insert(0, str(Path(__file__).parent))
+        from app import message_requests_narrative
+        assert message_requests_narrative("write up this finding") is True
+        assert message_requests_narrative("Can you document this?") is True
+        assert message_requests_narrative("Generate a report for this drug") is True
+        assert message_requests_narrative("Create a memo on the results") is True
+        assert message_requests_narrative("Please draft a summary") is True
+
+    def test_keyword_detection_negative(self):
+        """message_requests_narrative returns False for standard queries."""
+        sys.path.insert(0, str(Path(__file__).parent))
+        from app import message_requests_narrative
+        assert message_requests_narrative("analyze metformin safety profile") is False
+        assert message_requests_narrative("What is the adverse score for ibuprofen?") is False
+
+    # ── Narrative content tests ──
+
+    def test_narrative_contains_all_ich_sections(self, sample_narrative_output):
+        """Sample narrative contains all six ICH E2E section headings."""
+        import re
+        narrative_match = re.search(
+            r'<!-- SIGNAL_NARRATIVE_START -->\s*(.*?)\s*<!-- SIGNAL_NARRATIVE_END -->',
+            sample_narrative_output, re.DOTALL
+        )
+        narrative_text = narrative_match.group(1)
+        for heading in [
+            "Signal Description",
+            "Data Source and Method",
+            "Statistical Analysis Summary",
+            "Clinical Assessment",
+            "Data Limitations",
+            "Recommendation",
+        ]:
+            assert heading in narrative_text, f"Missing section: {heading}"
+
+    def test_narrative_starts_with_draft_header(self, sample_narrative_output):
+        """Extracted narrative begins with DRAFT header."""
+        import re
+        narrative_match = re.search(
+            r'<!-- SIGNAL_NARRATIVE_START -->\s*(.*?)\s*<!-- SIGNAL_NARRATIVE_END -->',
+            sample_narrative_output, re.DOTALL
+        )
+        narrative_text = narrative_match.group(1).strip()
+        assert narrative_text.startswith("DRAFT")
+
+
 class TestPayloadStructure:
     """Tests that tool output payloads have all fields the system prompt expects."""
 

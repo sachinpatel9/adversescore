@@ -263,3 +263,37 @@ def sample_error_payload():
             "system_directive": "Inform the user that the AdverseScore tool encountered a system error and could not complete the analysis. Internal Error: test error",
         },
     }
+
+
+# ── FIXTURE: Signal Narrative ────────────────────────────────────────────────
+
+@pytest.fixture
+def sample_narrative_keywords():
+    """The set of keywords that trigger narrative generation."""
+    return {"write", "narrative", "document", "report", "summarise", "summarize", "memo", "draft"}
+
+
+@pytest.fixture
+def sample_narrative_output():
+    """A mock LLM response containing a Signal Evaluation Narrative with ICH E2E sections."""
+    return (
+        "## Metformin — AdverseScore: 45/100\n\n"
+        "Some standard analysis content here.\n\n"
+        "<!-- SIGNAL_NARRATIVE_START -->\n"
+        "DRAFT — For Human Review Only\n\n"
+        "### 1. Signal Description\n"
+        "Metformin hydrochloride was identified with an AdverseScore of 45.\n\n"
+        "### 2. Data Source and Method\n"
+        "Data sourced from FDA Adverse Event Reporting System (FAERS) via openFDA API.\n\n"
+        "### 3. Statistical Analysis Summary\n"
+        "PRR of 2.5 (95% CI lower bound: 1.8) indicates disproportionate reporting.\n\n"
+        "### 4. Clinical Assessment\n"
+        "The signal pattern suggests elevated reporting relative to class peers. "
+        "Note: this interpretation requires clinical validation.\n\n"
+        "### 5. Data Limitations\n"
+        "Report count of 150 provides medium confidence. FAERS is subject to reporting bias.\n\n"
+        "### 6. Recommendation\n"
+        "Recommend clinician review of the emerging signal pattern.\n\n"
+        "This tool is for informational purposes only and does not constitute medical advice.\n"
+        "<!-- SIGNAL_NARRATIVE_END -->\n"
+    )

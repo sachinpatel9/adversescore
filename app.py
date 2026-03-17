@@ -9,8 +9,16 @@ if src_path not in sys.path:
     sys.path.append(src_path)
 
 import streamlit as st
+import streamlit.components.v1 as components
 from adverse_score.orchestrator import agent_executor
 from langchain_core.messages import HumanMessage, AIMessage
+
+NARRATIVE_KEYWORDS = {"write", "narrative", "document", "report", "summarise", "summarize", "memo", "draft"}
+
+def message_requests_narrative(text: str) -> bool:
+    """Check if a user message contains documentation-intent keywords."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in NARRATIVE_KEYWORDS)
 
 #UI Configuration
 st.set_page_config(page_title="AdverseScore Clinical AI", page_icon="⚕️", layout='centered')
@@ -135,6 +143,15 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                     config={'recursion_limit': 10}
                 )
                 output = response['messages'][-1].content
+                # Extract Signal Evaluation Narrative if present
+                narrative_match = re.search(
+                    r'<!-- SIGNAL_NARRATIVE_START -->\s*(.*?)\s*<!-- SIGNAL_NARRATIVE_END -->',
+                    output, re.DOTALL
+                )
+                narrative_text = None
+                if narrative_match and message_requests_narrative(prompt):
+                    narrative_text = narrative_match.group(1).strip()
+                    output = output[:narrative_match.start()].rstrip() + output[narrative_match.end():].lstrip('\n')
                 # Extract Score Rationale section for expander rendering
                 rationale_match = re.search(
                     r'(?:#{1,3}\s*\**Score Rationale\**|(?:\d+\.\s*)?\**Score Rationale\**)'
@@ -159,6 +176,27 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                     st.warning("UNLABELED — This adverse event is not in the official drug label")
                 elif "LABEL_STATUS_UNKNOWN" in output_upper:
                     st.info("Label status could not be determined from FDA data")
+
+                # Render Signal Evaluation Narrative in expander with download/copy
+                if narrative_text:
+                    with st.expander("Signal Evaluation Narrative — Draft", expanded=False):
+                        st.markdown(narrative_text)
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.download_button(
+                                "Download as .txt",
+                                data=narrative_text,
+                                file_name="signal_narrative.txt",
+                                mime="text/plain"
+                            )
+                        with col2:
+                            escaped = narrative_text.replace('`', '\\`').replace('\\', '\\\\')
+                            components.html(
+                                f"""<button onclick="navigator.clipboard.writeText(`{escaped}`).then(()=>this.textContent='Copied!')"
+                                style="padding:0.4em 1em;border:1px solid #ccc;border-radius:4px;cursor:pointer;background:#fff;font-family:sans-serif;font-size:14px;">
+                                Copy to clipboard</button>""",
+                                height=45
+                            )
 
                 st.session_state.messages.append({'role': 'assistant', 'content': output})
             except Exception as e:
