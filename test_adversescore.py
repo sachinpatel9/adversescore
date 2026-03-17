@@ -316,6 +316,32 @@ class TestLabelAndDiscovery:
         assert "HEADACHE" not in counts
 
 
+class TestLabelClassification:
+    """Tests for _classify_label_status() — LABELED/UNLABELED/LABEL_STATUS_UNKNOWN classification."""
+
+    def test_classify_labeled_when_symptom_in_label(self, client):
+        """Symptom found in label text → LABELED."""
+        label_text = "adverse reactions: nausea, fatigue, headache, hepatotoxicity"
+        result = client._classify_label_status(label_text, "nausea, fatigue")
+        assert result == "LABELED"
+
+    def test_classify_unlabeled_when_symptom_not_in_label(self, client):
+        """Symptom absent from label text → UNLABELED."""
+        label_text = "adverse reactions: nausea, fatigue"
+        result = client._classify_label_status(label_text, "pancreatitis")
+        assert result == "UNLABELED"
+
+    def test_classify_unknown_when_no_label_text(self, client):
+        """Empty label text → LABEL_STATUS_UNKNOWN."""
+        result = client._classify_label_status("", "nausea")
+        assert result == "LABEL_STATUS_UNKNOWN"
+
+    def test_classify_unknown_when_no_symptoms(self, client):
+        """Empty symptoms string → LABEL_STATUS_UNKNOWN."""
+        result = client._classify_label_status("adverse reactions: nausea", "")
+        assert result == "LABEL_STATUS_UNKNOWN"
+
+
 # ── SECTION 3: Statistical Math Accuracy Tests ──────────────────────────────
 # Tests for scoring formulas, confidence metrics, PRR, and guardrails in client.py.
 # Uses a client instance that bypasses network calls for pure math testing.
@@ -757,6 +783,15 @@ class TestOrchestratorWiring:
         assert "most clinically significant signal" in normalized
         assert "do not bury" in normalized
 
+    def test_system_prompt_contains_label_status_guidance(self):
+        """System prompt includes LABELED/UNLABELED label status guidance in RESPONSE FORMAT."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "label status" in normalized
+        assert "LABELED" in system_instructions
+        assert "UNLABELED" in system_instructions
+        assert "lead with unlabeled signals" in normalized
+
 
 class TestPayloadStructure:
     """Tests that tool output payloads have all fields the system prompt expects."""
@@ -778,6 +813,19 @@ class TestPayloadStructure:
         assert "adverse_score" in sample_agent_payload["clinical_signal"]
         assert "report_count" in sample_agent_payload["data_integrity"]
         assert "diagnosis_lock" in sample_agent_payload["agent_directives"]
+
+    def test_label_status_in_clinical_signal(self, sample_agent_payload):
+        """Payload includes label_status field in clinical_signal."""
+        assert "label_status" in sample_agent_payload["clinical_signal"]
+        assert sample_agent_payload["clinical_signal"]["label_status"] in [
+            "LABELED", "UNLABELED", "LABEL_STATUS_UNKNOWN"
+        ]
+
+    def test_label_status_in_prr_metrics(self, sample_agent_payload_with_prr):
+        """PRR metrics payload includes label_status for the target symptom."""
+        prr = sample_agent_payload_with_prr["pharmacovigilance_metrics"]
+        assert "label_status" in prr
+        assert prr["label_status"] in ["LABELED", "UNLABELED", "LABEL_STATUS_UNKNOWN"]
 
     def test_payload_demographics_injected(self):
         """extracted_demographics dict with age, sex, and target_symptom is added to metadata."""

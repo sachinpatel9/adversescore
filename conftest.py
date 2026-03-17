@@ -211,6 +211,7 @@ def sample_agent_payload():
             "status": "Monitor - Emerging Trend for KEYTRUDA",
             "relative_risk": "Average",
             "class_benchmark_avg": 42.0,
+            "label_status": "UNLABELED",
         },
         "data_integrity": {
             "report_count": 150,
@@ -225,6 +226,23 @@ def sample_agent_payload():
             "system_directive": "Halt autonomous clinical advice if requires_human_review is True.",
         },
     }
+
+
+# ── FIXTURE: Agent Payload With PRR Metrics ──────────────────────────────────
+
+@pytest.fixture
+def sample_agent_payload_with_prr(sample_agent_payload):
+    """A complete payload with pharmacovigilance_metrics populated including label_status."""
+    sample_agent_payload["pharmacovigilance_metrics"] = {
+        "prr": 2.5,
+        "ci_lower": 1.8,
+        "signal_detected": True,
+        "target_symptom": "HEPATOTOXICITY",
+        "drug_cases": 10,
+        "class_cases": 20,
+        "label_status": "LABELED",
+    }
+    return sample_agent_payload
 
 
 # ── FIXTURE: Error Payload ───────────────────────────────────────────────────

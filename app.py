@@ -153,6 +153,13 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                         st.markdown(remainder)
                 else:
                     st.markdown(output)
+                # Render label status badge based on LLM response content
+                output_upper = output.upper()
+                if "UNLABELED" in output_upper:
+                    st.warning("UNLABELED — This adverse event is not in the official drug label")
+                elif "LABEL_STATUS_UNKNOWN" in output_upper:
+                    st.info("Label status could not be determined from FDA data")
+
                 st.session_state.messages.append({'role': 'assistant', 'content': output})
             except Exception as e:
                 st.error(f"System Error: {str(e)}")

@@ -193,7 +193,21 @@ class AdverseScoreClient:
         #calculate weighted signal
         raw_score = base_weight * penalty
         return raw_score
-    
+
+    def _classify_label_status(self, label_text: str, symptoms_str: str) -> str:
+        '''
+        Classifies a symptom string as LABELED, UNLABELED, or LABEL_STATUS_UNKNOWN
+        based on whether any symptom appears in the drug's official FDA label text.
+        '''
+        if not label_text:
+            return "LABEL_STATUS_UNKNOWN"
+        symptom_list = [s.strip().lower() for s in symptoms_str.split(",") if s.strip()]
+        if not symptom_list:
+            return "LABEL_STATUS_UNKNOWN"
+        if any(s in label_text for s in symptom_list):
+            return "LABELED"
+        return "UNLABELED"
+
     def _discover_drug_class(self, drug_name: str) -> str:
         '''
         Discovers the primary therapeutic class using frequency analysis on historical adverse event data, bypassing label noise
@@ -449,7 +463,7 @@ class AdverseScoreClient:
         except Exception:
             return {}
     
-    def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
+    def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None, label_text: str = "") -> dict: #type: ignore case
         '''
         Executes the PRR ratio calculation and 95% confidence interval math.
 
@@ -480,9 +494,12 @@ class AdverseScoreClient:
         c = class_counts.get(symptom_upper, 0)
         c_plus_d = sum(class_counts.values())
 
+        #classify label status for the target symptom
+        symptom_label_status = self._classify_label_status(label_text, target_symptom)
+
         #guard against division by zero or stat insignificant sample size
         if a < 3 or c == 0 or a_plus_b == 0 or c_plus_d == 0:
-            return {"prr": 0.0, "ci_lower": 0.0, "signal_detected": False, "target_symptom": symptom_upper, "drug_cases": a, "class_cases": c}
+            return {"prr": 0.0, "ci_lower": 0.0, "signal_detected": False, "target_symptom": symptom_upper, "drug_cases": a, "class_cases": c, "label_status": symptom_label_status}
 
         prr = (a / a_plus_b) / (c / c_plus_d)
 
@@ -509,7 +526,8 @@ class AdverseScoreClient:
             "signal_detected": signal_detected,
             "target_symptom": target_symptom,
             "drug_cases": a,
-            "class_cases": c
+            "class_cases": c,
+            "label_status": symptom_label_status
         }    
 
     
@@ -546,14 +564,18 @@ class AdverseScoreClient:
                 }
             }
         
-        #fetch label text once for this drug to use in the loop 
+        #fetch label text once for this drug to use in the loop
         label_text = self.fetch_label_text(drug_name)
+
+        #determine overall label status from all report symptoms
+        all_symptoms = ", ".join(r.get("symptoms", "") for r in clean_reports)
+        label_status = self._classify_label_status(label_text, all_symptoms)
 
         prr_metrics = None
         if target_symptom:
             pharm_class = self._discover_drug_class(drug_name)
             if pharm_class:
-                prr_metrics = self._calculate_prr_metrics(drug_name, pharm_class, target_symptom, patient_age, patient_sex)
+                prr_metrics = self._calculate_prr_metrics(drug_name, pharm_class, target_symptom, patient_age, patient_sex, label_text=label_text)
 
         total_weighted_points = 0
         ninety_days_ago = datetime.now() - timedelta(days=90)
@@ -619,7 +641,8 @@ class AdverseScoreClient:
                 "adverse_score": final_score,
                 "status": status,
                 "relative_risk": relative_risk,
-                "class_benchmark_avg": benchmark_avg
+                "class_benchmark_avg": benchmark_avg,
+                "label_status": label_status
             },
             "data_integrity": {
                 "report_count": len(clean_reports),
