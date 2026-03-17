@@ -297,3 +297,59 @@ def sample_narrative_output():
         "This tool is for informational purposes only and does not constitute medical advice.\n"
         "<!-- SIGNAL_NARRATIVE_END -->\n"
     )
+
+
+# ── FIXTURE: Temporal Trend Analysis ─────────────────────────────────────────
+
+@pytest.fixture
+def sample_time_series_rising():
+    """A time_series array exhibiting a RISING trend (delta >= 10)."""
+    return [
+        {"quarter": "2025-Q2", "adverse_score": 30, "prr": 1.5, "report_count": 100},
+        {"quarter": "2025-Q3", "adverse_score": 33, "prr": 1.7, "report_count": 110},
+        {"quarter": "2025-Q4", "adverse_score": 38, "prr": 2.0, "report_count": 120},
+        {"quarter": "2026-Q1", "adverse_score": 48, "prr": 2.5, "report_count": 85},
+    ]
+
+
+@pytest.fixture
+def sample_time_series_stable():
+    """A time_series array exhibiting a STABLE trend (delta < 10)."""
+    return [
+        {"quarter": "2025-Q2", "adverse_score": 40, "prr": 1.8, "report_count": 100},
+        {"quarter": "2025-Q3", "adverse_score": 42, "prr": 1.9, "report_count": 105},
+        {"quarter": "2025-Q4", "adverse_score": 41, "prr": 1.8, "report_count": 110},
+        {"quarter": "2026-Q1", "adverse_score": 43, "prr": 1.9, "report_count": 95},
+    ]
+
+
+@pytest.fixture
+def sample_time_series_declining():
+    """A time_series array exhibiting a DECLINING trend (delta <= -10)."""
+    return [
+        {"quarter": "2025-Q2", "adverse_score": 55, "prr": 2.8, "report_count": 130},
+        {"quarter": "2025-Q3", "adverse_score": 50, "prr": 2.4, "report_count": 125},
+        {"quarter": "2025-Q4", "adverse_score": 45, "prr": 2.0, "report_count": 115},
+        {"quarter": "2026-Q1", "adverse_score": 40, "prr": 1.6, "report_count": 100},
+    ]
+
+
+@pytest.fixture
+def sample_time_series_insufficient():
+    """A time_series array with insufficient data (only 1 valid quarter)."""
+    return [
+        {"quarter": "2025-Q2", "adverse_score": 0, "prr": None, "report_count": 0},
+        {"quarter": "2025-Q3", "adverse_score": 0, "prr": None, "report_count": 0},
+        {"quarter": "2025-Q4", "adverse_score": 0, "prr": None, "report_count": 0},
+        {"quarter": "2026-Q1", "adverse_score": 42, "prr": 1.9, "report_count": 85},
+    ]
+
+
+@pytest.fixture
+def sample_agent_payload_with_temporal(sample_agent_payload, sample_time_series_rising):
+    """A complete payload with temporal_analysis populated."""
+    sample_agent_payload["temporal_analysis"] = {
+        "time_series": sample_time_series_rising,
+        "trend_classification": "RISING",
+    }
+    return sample_agent_payload

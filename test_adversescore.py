@@ -111,6 +111,22 @@ class TestClinicalQuerySchemaRejection:
             ClinicalQuerySchema(drug_name="X", target_symptom="")
 
 
+class TestClinicalQuerySchemaIncludeTemporal:
+    """Tests for the include_temporal field on ClinicalQuerySchema."""
+
+    def test_include_temporal_true(self):
+        result = ClinicalQuerySchema(drug_name="ASPIRIN", include_temporal=True)
+        assert result.include_temporal is True
+
+    def test_include_temporal_false(self):
+        result = ClinicalQuerySchema(drug_name="ASPIRIN", include_temporal=False)
+        assert result.include_temporal is False
+
+    def test_include_temporal_default_none(self):
+        result = ClinicalQuerySchema(drug_name="ASPIRIN")
+        assert result.include_temporal is None
+
+
 # ── SECTION 2: openFDA API Integration Tests ────────────────────────────────
 # Tests for AdverseScoreClient methods in client.py.
 # These should mock HTTP responses to avoid hitting the real FDA API.
@@ -153,6 +169,21 @@ class TestQueryBuilder:
     def test_sanitize_for_query_clean_input(self, client):
         """Normal drug names like 'KEYTRUDA' pass through unchanged."""
         assert client._sanitize_for_query("KEYTRUDA") == "KEYTRUDA"
+
+
+class TestBuildQueryDateRange:
+    """Tests for build_query() with explicit start_date/end_date parameters."""
+
+    def test_explicit_date_range(self, client):
+        """When start_date and end_date are provided, they appear in the query instead of days_back."""
+        query = client.build_query("ASPIRIN", start_date="20250401", end_date="20250630")
+        assert "20250401" in query
+        assert "20250630" in query
+
+    def test_days_back_still_works(self, client):
+        """Without start_date/end_date, the query still uses days_back for date range."""
+        query = client.build_query("ASPIRIN", days_back=30)
+        assert "receivedate:" in query
 
 
 class TestFetchEvents:
@@ -724,6 +755,64 @@ class TestGuardrails:
         pass
 
 
+class TestComputeQuarterBoundaries:
+    """Tests for _compute_quarter_boundaries() method."""
+
+    def test_returns_requested_count(self, client):
+        result = client._compute_quarter_boundaries(4)
+        assert len(result) == 4
+
+    def test_quarter_label_format(self, client):
+        import re as re_mod
+        result = client._compute_quarter_boundaries(4)
+        for label, start, end in result:
+            assert re_mod.match(r"\d{4}-Q[1-4]", label), f"Invalid label: {label}"
+
+    def test_date_format(self, client):
+        result = client._compute_quarter_boundaries(4)
+        for label, start, end in result:
+            assert len(start) == 8 and start.isdigit(), f"Invalid start date: {start}"
+            assert len(end) == 8 and end.isdigit(), f"Invalid end date: {end}"
+
+    def test_chronological_order(self, client):
+        result = client._compute_quarter_boundaries(4)
+        for i in range(1, len(result)):
+            assert result[i][1] > result[i-1][2], "Quarters not in chronological order"
+
+
+class TestComputeTrend:
+    """Tests for compute_trend() method."""
+
+    def test_trend_rising(self, client, sample_time_series_rising):
+        assert client.compute_trend(sample_time_series_rising) == "RISING"
+
+    def test_trend_stable(self, client, sample_time_series_stable):
+        assert client.compute_trend(sample_time_series_stable) == "STABLE"
+
+    def test_trend_declining(self, client, sample_time_series_declining):
+        assert client.compute_trend(sample_time_series_declining) == "DECLINING"
+
+    def test_trend_insufficient_data(self, client, sample_time_series_insufficient):
+        assert client.compute_trend(sample_time_series_insufficient) == "INSUFFICIENT_DATA"
+
+    def test_trend_empty_list(self, client):
+        assert client.compute_trend([]) == "INSUFFICIENT_DATA"
+
+    def test_trend_single_quarter(self, client):
+        single = [{"quarter": "2026-Q1", "adverse_score": 42, "prr": 1.9, "report_count": 85}]
+        assert client.compute_trend(single) == "INSUFFICIENT_DATA"
+
+    def test_trend_boundary_exactly_10(self, client):
+        """Delta of exactly 10 (recent vs 2-quarters-prior) should classify as RISING."""
+        data = [
+            {"quarter": "2025-Q2", "adverse_score": 30, "prr": None, "report_count": 50},
+            {"quarter": "2025-Q3", "adverse_score": 35, "prr": None, "report_count": 60},
+            {"quarter": "2025-Q4", "adverse_score": 38, "prr": None, "report_count": 70},
+            {"quarter": "2026-Q1", "adverse_score": 45, "prr": None, "report_count": 80},
+        ]
+        assert client.compute_trend(data) == "RISING"  # 45 - 35 = 10
+
+
 # ── SECTION 4: LangGraph Agent Behavior Tests ───────────────────────────────
 # Tests for orchestrator wiring, system prompt compliance, and payload structure.
 
@@ -909,6 +998,78 @@ class TestSignalNarrativeProtocol:
         )
         narrative_text = narrative_match.group(1).strip()
         assert narrative_text.startswith("DRAFT")
+
+
+class TestTemporalAnalysisProtocol:
+    """Tests for the Temporal Trend Analysis (Priority 4)."""
+
+    # ── System prompt tests ──
+
+    def test_system_prompt_contains_temporal_protocol(self):
+        """System prompt includes TEMPORAL ANALYSIS PROTOCOL with trigger keywords."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "temporal analysis protocol" in normalized
+        for keyword in ["trend", "over time", "quarterly", "changing", "getting worse",
+                        "getting better", "historical", "last quarter", "recent quarters"]:
+            assert keyword in normalized, f"Missing temporal keyword: {keyword}"
+
+    def test_system_prompt_temporal_markers(self):
+        """System prompt contains TIME_SERIES_DATA marker instructions."""
+        from adverse_score.orchestrator import system_instructions
+        assert "TIME_SERIES_DATA_START" in system_instructions
+        assert "TIME_SERIES_DATA_END" in system_instructions
+
+    # ── Keyword detection tests ──
+
+    def test_temporal_keyword_detection_positive(self):
+        """message_requests_temporal returns True for temporal queries."""
+        sys.path.insert(0, str(Path(__file__).parent))
+        from app import message_requests_temporal
+        assert message_requests_temporal("Show me the trend for aspirin") is True
+        assert message_requests_temporal("How has aspirin changed over time") is True
+        assert message_requests_temporal("quarterly analysis of aspirin") is True
+        assert message_requests_temporal("Is aspirin getting worse") is True
+
+    def test_temporal_keyword_detection_negative(self):
+        """message_requests_temporal returns False for standard queries."""
+        sys.path.insert(0, str(Path(__file__).parent))
+        from app import message_requests_temporal
+        assert message_requests_temporal("analyze metformin safety profile") is False
+        assert message_requests_temporal("What is the adverse score for ibuprofen?") is False
+
+    # ── Regex extraction tests ──
+
+    def test_time_series_regex_extracts_json(self):
+        """Regex extracts valid JSON from time_series markers."""
+        import re
+        import json
+        mock_output = (
+            "Some analysis text.\n\n"
+            "<!-- TIME_SERIES_DATA_START -->\n"
+            '[{"quarter":"2025-Q2","adverse_score":30,"prr":1.5,"report_count":100},'
+            '{"quarter":"2025-Q3","adverse_score":35,"prr":1.7,"report_count":110}]\n'
+            "<!-- TIME_SERIES_DATA_END -->\n\n"
+            "More text."
+        )
+        match = re.search(
+            r'<!-- TIME_SERIES_DATA_START -->\s*(.*?)\s*<!-- TIME_SERIES_DATA_END -->',
+            mock_output, re.DOTALL
+        )
+        assert match is not None
+        data = json.loads(match.group(1).strip())
+        assert len(data) == 2
+        assert data[0]["quarter"] == "2025-Q2"
+
+    def test_time_series_regex_no_match_without_markers(self):
+        """Standard response without markers returns no match."""
+        import re
+        standard_output = "## Drug Analysis\n\nAdverseScore: 45/100\n\nSome analysis."
+        match = re.search(
+            r'<!-- TIME_SERIES_DATA_START -->\s*(.*?)\s*<!-- TIME_SERIES_DATA_END -->',
+            standard_output, re.DOTALL
+        )
+        assert match is None
 
 
 class TestPayloadStructure:

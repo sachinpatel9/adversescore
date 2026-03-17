@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import json
 from pathlib import Path
 
 #pointing python to 'srs' directory
@@ -10,6 +11,7 @@ if src_path not in sys.path:
 
 import streamlit as st
 import streamlit.components.v1 as components
+import plotly.graph_objects as go
 from adverse_score.orchestrator import agent_executor
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -19,6 +21,13 @@ def message_requests_narrative(text: str) -> bool:
     """Check if a user message contains documentation-intent keywords."""
     text_lower = text.lower()
     return any(kw in text_lower for kw in NARRATIVE_KEYWORDS)
+
+TEMPORAL_KEYWORDS = {"trend", "over time", "quarterly", "changing", "getting worse", "getting better", "historical", "last quarter", "recent quarters"}
+
+def message_requests_temporal(text: str) -> bool:
+    """Check if a user message contains temporal analysis keywords."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in TEMPORAL_KEYWORDS)
 
 #UI Configuration
 st.set_page_config(page_title="AdverseScore Clinical AI", page_icon="⚕️", layout='centered')
@@ -152,6 +161,18 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                 if narrative_match and message_requests_narrative(prompt):
                     narrative_text = narrative_match.group(1).strip()
                     output = output[:narrative_match.start()].rstrip() + output[narrative_match.end():].lstrip('\n')
+                # Extract time_series JSON for Plotly chart
+                time_series_match = re.search(
+                    r'<!-- TIME_SERIES_DATA_START -->\s*(.*?)\s*<!-- TIME_SERIES_DATA_END -->',
+                    output, re.DOTALL
+                )
+                time_series_data = None
+                if time_series_match and message_requests_temporal(prompt):
+                    try:
+                        time_series_data = json.loads(time_series_match.group(1).strip())
+                    except json.JSONDecodeError:
+                        time_series_data = None
+                    output = output[:time_series_match.start()].rstrip() + output[time_series_match.end():].lstrip('\n')
                 # Extract Score Rationale section for expander rendering
                 rationale_match = re.search(
                     r'(?:#{1,3}\s*\**Score Rationale\**|(?:\d+\.\s*)?\**Score Rationale\**)'
@@ -176,6 +197,40 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                     st.warning("UNLABELED — This adverse event is not in the official drug label")
                 elif "LABEL_STATUS_UNKNOWN" in output_upper:
                     st.info("Label status could not be determined from FDA data")
+
+                # Render temporal trend chart and badge
+                if time_series_data and len(time_series_data) >= 2:
+                    quarters = [d["quarter"] for d in time_series_data]
+                    scores = [d["adverse_score"] for d in time_series_data]
+                    prr_values = [d.get("prr") for d in time_series_data]
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=quarters, y=scores, mode='lines+markers',
+                        name='AdverseScore', line=dict(color='#1a73e8', width=2), marker=dict(size=8)
+                    ))
+                    if any(v is not None for v in prr_values):
+                        fig.add_trace(go.Scatter(
+                            x=quarters, y=[v if v is not None else 0 for v in prr_values],
+                            mode='lines+markers', name='PRR', yaxis='y2',
+                            line=dict(color='#e8711a', width=2, dash='dot'), marker=dict(size=6)
+                        ))
+                        fig.update_layout(yaxis2=dict(title='PRR', overlaying='y', side='right', showgrid=False))
+                    fig.update_layout(
+                        title='Quarterly Trend Analysis', xaxis_title='Quarter',
+                        yaxis_title='AdverseScore (0-100)', template='plotly_white',
+                        height=350, margin=dict(t=40, b=40, l=50, r=50),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    delta = scores[-1] - (scores[-3] if len(scores) >= 3 else scores[0])
+                    if delta >= 10:
+                        st.warning("RISING — AdverseScore increased by 10+ points over recent quarters")
+                    elif delta <= -10:
+                        st.success("DECLINING — AdverseScore decreased by 10+ points over recent quarters")
+                    else:
+                        st.info("STABLE — AdverseScore remained within 10 points over recent quarters")
 
                 # Render Signal Evaluation Narrative in expander with download/copy
                 if narrative_text:

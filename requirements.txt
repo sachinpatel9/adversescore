@@ -12,5 +12,6 @@ langgraph>=0.0.1
 # Utilities
 pydantic>=2.0.0
 
-#Front End 
+#Front End
 streamlit
+plotly>=5.18.0

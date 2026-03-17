@@ -26,16 +26,19 @@ class AdverseScoreClient:
         self.session = self._get_transport_session()
 
 
-    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500, patient_age: int = None, patient_sex: str = None) -> str:  # type: ignore
+    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500, patient_age: int = None, patient_sex: str = None, start_date: str = None, end_date: str = None) -> str:  # type: ignore
         '''
         Constructs a valid openFDA Lucene search query.
         Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]
         '''
 
         #Handle dates: YYYYMMDD format
-        end_date = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
-        date_range = f"[{start_date}+TO+{end_date}]"
+        if start_date and end_date:
+            date_range = f"[{start_date}+TO+{end_date}]"
+        else:
+            end_date_str = datetime.now().strftime('%Y%m%d')
+            start_date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+            date_range = f"[{start_date_str}+TO+{end_date_str}]"
 
         # Sanitize drug_name before embedding in Lucene query — an unescaped quote
         # in the name (e.g. a malformed LLM extraction) would break the query syntax.
@@ -82,7 +85,99 @@ class AdverseScoreClient:
         # Drug names and class names are interpolated into Lucene quoted strings
         return value.replace('\\', '\\\\').replace('"', '\\"')
 
-    def fetch_events(self, drug_name: str, patient_age: int = None, patient_sex: str = None): # type: ignore
+    def _compute_quarter_boundaries(self, num_quarters: int = 4) -> list:
+        """Return [(label, start_YYYYMMDD, end_YYYYMMDD), ...] for the last N calendar quarters."""
+        today = datetime.now()
+        current_q = (today.month - 1) // 3  # 0-indexed: 0=Q1, 1=Q2, 2=Q3, 3=Q4
+        current_year = today.year
+        quarters = []
+        for i in range(num_quarters - 1, -1, -1):
+            q_index = current_q - i
+            year = current_year
+            while q_index < 0:
+                q_index += 4
+                year -= 1
+            month_start = q_index * 3 + 1
+            if q_index == 3:
+                month_end = 12
+                month_end_day = 31
+            else:
+                month_end = (q_index + 1) * 3
+                if month_end in (1, 3, 5, 7, 8, 10, 12):
+                    month_end_day = 31
+                elif month_end == 2:
+                    month_end_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+                else:
+                    month_end_day = 30
+            label = f"{year}-Q{q_index + 1}"
+            start = f"{year}{month_start:02d}01"
+            end = f"{year}{month_end:02d}{month_end_day:02d}"
+            quarters.append((label, start, end))
+        return quarters
+
+    def fetch_quarterly_data(self, drug_name, num_quarters=4, patient_age=None, patient_sex=None, target_symptom=None):
+        """Calculate AdverseScore and PRR per quarter. Returns [{quarter, adverse_score, prr, report_count}]."""
+        boundaries = self._compute_quarter_boundaries(num_quarters)
+        pharm_class = None
+        if target_symptom:
+            pharm_class = self._discover_drug_class(drug_name)
+
+        time_series = []
+        for label, start, end in boundaries:
+            raw = self.fetch_events(drug_name, patient_age=patient_age, patient_sex=patient_sex, start_date=start, end_date=end)
+            reports = self._flatten_results(raw) if raw else []
+            report_count = len(reports)
+
+            if reports:
+                result = self.calculate_final_score(
+                    drug_name, reports, skip_benchmark=True,
+                    patient_age=patient_age, patient_sex=patient_sex,
+                    target_symptom=target_symptom
+                )
+                score = result["clinical_signal"]["adverse_score"]
+            else:
+                score = 0
+
+            prr_value = None
+            if target_symptom and pharm_class:
+                drug_counts = self._fetch_symptom_counts(
+                    drug_name=drug_name, patient_age=patient_age,
+                    patient_sex=patient_sex, start_date=start, end_date=end
+                )
+                class_counts = self._fetch_symptom_counts(
+                    pharm_class=pharm_class, patient_age=patient_age,
+                    patient_sex=patient_sex, start_date=start, end_date=end
+                )
+                a = drug_counts.get(target_symptom.upper(), 0)
+                a_plus_b = sum(drug_counts.values()) or 1
+                c = class_counts.get(target_symptom.upper(), 0)
+                c_plus_d = sum(class_counts.values()) or 1
+                if a >= 3 and c_plus_d > 0 and a_plus_b > 0:
+                    prr_value = round((a / a_plus_b) / (c / c_plus_d), 2)
+
+            time_series.append({
+                "quarter": label,
+                "adverse_score": round(score),
+                "prr": prr_value,
+                "report_count": report_count,
+            })
+        return time_series
+
+    def compute_trend(self, time_series):
+        """Classify trend: RISING/STABLE/DECLINING/INSUFFICIENT_DATA."""
+        valid = [q for q in time_series if q.get("report_count", 0) > 0]
+        if len(valid) < 2:
+            return "INSUFFICIENT_DATA"
+        recent = valid[-1]["adverse_score"]
+        comparison = valid[-3]["adverse_score"] if len(valid) >= 3 else valid[0]["adverse_score"]
+        delta = recent - comparison
+        if delta >= 10:
+            return "RISING"
+        elif delta <= -10:
+            return "DECLINING"
+        return "STABLE"
+
+    def fetch_events(self, drug_name: str, patient_age: int = None, patient_sex: str = None, start_date: str = None, end_date: str = None): # type: ignore
         '''
         Executes the API call using the query builder and the session.
         Note on pagination: openFDA caps results at limit=1000 and skip+limit<=26000.
@@ -90,7 +185,7 @@ class AdverseScoreClient:
         accounts for sample size, and the count endpoints used for PRR aggregate server-side
         with no pagination cap. Fetching all reports is not practical for real-time scoring.
         '''
-        query_params = self.build_query(drug_name, patient_age=patient_age, patient_sex=patient_sex)
+        query_params = self.build_query(drug_name, patient_age=patient_age, patient_sex=patient_sex, start_date=start_date, end_date=end_date)
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
         try:
@@ -418,7 +513,7 @@ class AdverseScoreClient:
             "system_directive": "Halt autonomous clinical advice if requires_human_review is True."
         }
 
-    def _fetch_symptom_counts(self, drug_name: str = None, pharm_class: str = None, patient_age: int = None, patient_sex: str = None) -> dict: #type: ignore case
+    def _fetch_symptom_counts(self, drug_name: str = None, pharm_class: str = None, patient_age: int = None, patient_sex: str = None, start_date: str = None, end_date: str = None) -> dict: #type: ignore case
         '''
         Hits the openFDA count endpoint for a specific drug or a pharmacologic class - forces the FDA servers to aggregate symptom frequencies instantly
         '''
@@ -440,7 +535,9 @@ class AdverseScoreClient:
             lower = max(0, patient_age - 5)
             upper = patient_age + 5
             query_parts.append(f'patient.patientonsetage:[{lower}+TO+{upper}]')
-        
+        if start_date and end_date:
+            query_parts.append(f'receivedate:[{start_date}+TO+{end_date}]')
+
         search_string = "+AND+".join([q.replace(" ", "+") for q in query_parts])
         url = f"{self.base_url}?search={search_string}&count=patient.reaction.reactionmeddrapt.exact&limit=1000&api_key={self.api_key}"
 

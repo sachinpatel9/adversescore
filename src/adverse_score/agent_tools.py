@@ -30,6 +30,10 @@ class ClinicalQuerySchema(BaseModel):
         min_length=1,
         description="The specific adverse event, side effect, or symptom to analyze (eg. 'pancreatitis', 'fatigue') if provided."
     )
+    include_temporal: Optional[bool] = Field(
+        None,
+        description="Set to true when the user asks about trends, changes over time, quarterly data, or historical safety patterns."
+    )
 
     @field_validator("drug_name")
     @classmethod
@@ -41,7 +45,7 @@ class ClinicalQuerySchema(BaseModel):
 
 #Agent Tool 
 @tool(args_schema=ClinicalQuerySchema)
-def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= None, target_symptom: str = None) -> str: #type: ignore case
+def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= None, target_symptom: str = None, include_temporal: bool = None) -> str: #type: ignore case
     '''
     Calculates a clinial safety risk score (0-100) based on FDA adverse event reports,
     Call this tool when a user asks about the safety, side effects, toxicity, or risk profile of a specific medication.
@@ -72,6 +76,19 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
             'sex': patient_sex,
             'target_symptom': target_symptom
         }
+
+        if include_temporal:
+            print(f"[Agent Network] Temporal Analysis Requested for {drug_name.upper()}")
+            time_series = _global_client.fetch_quarterly_data(
+                drug_name, num_quarters=4,
+                patient_age=patient_age, patient_sex=patient_sex,
+                target_symptom=target_symptom
+            )
+            trend_classification = _global_client.compute_trend(time_series)
+            agent_payload['temporal_analysis'] = {
+                'time_series': time_series,
+                'trend_classification': trend_classification,
+            }
 
         return json.dumps(agent_payload)
 
