@@ -22,7 +22,7 @@ Built on a **LangGraph** architecture, the system utilizes a state-aware agent t
 ## Product Capabilities
 
 ### 1. Score Explainability
-Every response includes a mandatory **Score Rationale** section explaining which adverse event signals most influenced the score, whether they are labeled or unlabeled, how far the PRR was above or below threshold, what the peer benchmark contributed, and any data confidence caveats.
+Every response is a **cohesive clinical narrative** — flowing prose that integrates the score rationale, peer benchmark context, label status, and data confidence into a single assessment. The agent leads with the most clinically significant finding and adapts response length to query complexity, reading like a senior pharmacovigilance analyst summarising their findings verbally rather than filling in a templated form.
 
 ### 2. Unlabeled Signal Detection
 Automatically classifies adverse events as **LABELED** or **UNLABELED** by querying FDA drug labeling data. Applies severity-weighted label penalties to the AdverseScore calculation:
@@ -73,8 +73,10 @@ adversescore/
 │       └── config.py             # Environment & API key validation
 ├── data/                         # SQLite DB (auto-created, gitignored)
 ├── docs/                         # Product Requirements Document
-├── conftest.py                   # Pytest fixtures
-├── test_adversescore.py          # Test suite (150+ tests)
+├── conftest.py                   # Pytest fixtures (unit + E2E)
+├── test_adversescore.py          # Unit test suite (153 tests)
+├── test_e2e.py                   # E2E integration tests (29 tests, live API)
+├── pytest.ini                    # Pytest configuration & marker registration
 ├── requirements.txt              # Dependencies
 └── .env                          # API keys (gitignored)
 ```
@@ -128,7 +130,14 @@ The `data/` directory for SQLite persistence is created automatically on first r
 
 ### Running Tests
 ```bash
+# Unit tests (no API keys required, runs in ~4 seconds)
 python -m pytest test_adversescore.py -v
+
+# E2E integration tests (requires API keys in .env, ~10-15 minutes)
+python -m pytest test_e2e.py -v -m e2e
+
+# Full suite
+python -m pytest -v
 ```
 
 ---

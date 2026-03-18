@@ -42,6 +42,22 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - Peers with zero adverse event data are excluded from benchmark averages to prevent artificial score deflation.
 - A pre-commit hook in `.git/hooks/pre-commit` blocks `.env` files and scans for API key patterns.
 
-## No Test Suite
+## Test Suite
 
-There are currently no automated tests. When verifying changes, use `python -c "import ast; ast.parse(open('file').read())"` for syntax checks and manual validation against the openFDA API.
+The project has two test files:
+
+- **`test_adversescore.py`** — 153 unit tests covering Pydantic validation, query building, scoring math, PRR calculation, confidence metrics, guardrails, persistence, system prompt structure, narrative/temporal/delta protocols, and agent tool behavior. All tests use mocks — no API keys required. Runs in ~4 seconds.
+- **`test_e2e.py`** — 29 end-to-end integration tests hitting the live openFDA API and OpenAI LLM. Covers FDA API contract validation, full pipeline scoring, agent tool invocation, LLM response quality (prose format, disclaimer, scope enforcement), and performance benchmarks. Requires API keys in `.env`; tests skip gracefully when keys are absent.
+
+```bash
+# Unit tests only (fast, no API keys)
+python -m pytest test_adversescore.py -v
+
+# E2E integration tests (requires .env)
+python -m pytest test_e2e.py -v -m e2e
+
+# Full suite
+python -m pytest -v
+```
+
+For quick syntax validation without running full tests: `python -c "import ast; ast.parse(open('file').read())"`

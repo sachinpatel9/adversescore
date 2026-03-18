@@ -1,5 +1,43 @@
+import os
+import time
 import pytest
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Load .env so API keys are available for skip-guard evaluation
+load_dotenv()
+
+
+# ── E2E Skip Guards ────────────────────────────────────────────────────────
+# Applied to E2E tests so they skip cleanly when API keys are absent.
+
+SKIP_NO_FDA = pytest.mark.skipif(
+    not os.environ.get("OPENFDA_API_KEY"),
+    reason="OPENFDA_API_KEY not set — skipping live FDA API test"
+)
+SKIP_NO_OPENAI = pytest.mark.skipif(
+    not os.environ.get("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set — skipping LLM agent test"
+)
+
+
+# ── E2E Session-Scoped Client ─────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def e2e_client():
+    """Session-scoped AdverseScoreClient for E2E tests (reuses HTTP session)."""
+    from adverse_score.client import AdverseScoreClient
+    return AdverseScoreClient()
+
+
+# ── E2E Rate Limit Guard ──────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def rate_limit_guard(request):
+    """Inserts a 0.3s delay after each E2E test to respect openFDA rate limits."""
+    yield
+    if request.node.get_closest_marker("e2e"):
+        time.sleep(0.3)
 
 
 # ── FIXTURE: AdverseScoreClient Instance ─────────────────────────────────────
