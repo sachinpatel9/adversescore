@@ -927,39 +927,60 @@ class TestOrchestratorWiring:
         assert "do not retry" in system_instructions.lower()
 
     def test_system_prompt_contains_response_format(self):
-        """System prompt includes the 9-section RESPONSE FORMAT specification."""
+        """System prompt includes prose-based RESPONSE FORMAT requiring cohesive narrative and disclaimer."""
         from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
         assert "RESPONSE FORMAT" in system_instructions
-        assert "Drug name and AdverseScore" in system_instructions
-        assert "Clinical disclaimer" in system_instructions
+        # Must require cohesive prose, not numbered sections
+        assert "cohesive clinical narrative" in normalized
+        assert "not a numbered list" in normalized
+        # Disclaimer requirement preserved
+        assert "clinical disclaimer" in normalized
 
-    def test_system_prompt_contains_score_rationale(self):
-        """System prompt includes mandatory Score Rationale section in RESPONSE FORMAT."""
+    def test_system_prompt_requires_rationale_substance(self):
+        """System prompt requires integrating score rationale, peer context, and confidence into narrative."""
         from adverse_score.orchestrator import system_instructions
-        # Normalize whitespace for multi-line matching
         normalized = " ".join(system_instructions.lower().split())
-        assert "score rationale" in normalized
-        assert "mandatory" in normalized
-        assert "signals most influenced" in normalized
+        # RESPONSE FORMAT requires integrating these elements into prose
+        assert "rationale" in normalized
+        assert "peer context" in normalized or "peer benchmark" in normalized
+        assert "confidence" in normalized
+        # REASONING PROTOCOL still references PRR and signal analysis
         assert "PRR" in system_instructions
-        assert "peer benchmark" in normalized
-        assert "confidence caveats" in normalized
+        assert "signals" in normalized
 
-    def test_system_prompt_reasoning_leads_with_significant_signal(self):
-        """REASONING PROTOCOL instructs the LLM to lead Score Rationale with the most significant signal."""
+    def test_system_prompt_reasoning_leads_with_significant_finding(self):
+        """REASONING PROTOCOL instructs opening with the most clinically significant finding."""
         from adverse_score.orchestrator import system_instructions
         normalized = " ".join(system_instructions.lower().split())
-        assert "most clinically significant signal" in normalized
+        # New first bullet: lead with most significant finding as opening sentence
+        assert "most clinically significant" in normalized
+        assert "opening sentence" in normalized
+        # Original bullet: do not bury significant signals
         assert "do not bury" in normalized
 
-    def test_system_prompt_contains_label_status_guidance(self):
-        """System prompt includes LABELED/UNLABELED label status guidance in RESPONSE FORMAT."""
+    def test_system_prompt_integrates_label_status(self):
+        """System prompt requires label status to be integrated into the clinical narrative."""
         from adverse_score.orchestrator import system_instructions
         normalized = " ".join(system_instructions.lower().split())
+        # Label status is listed as a required element of the prose narrative
         assert "label status" in normalized
-        assert "LABELED" in system_instructions
-        assert "UNLABELED" in system_instructions
-        assert "lead with unlabeled signals" in normalized
+
+    def test_system_prompt_prose_format_excludes_numbered_sections(self):
+        """RESPONSE FORMAT explicitly prohibits numbered lists and structured sections."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "not a numbered list or structured sections" in normalized
+        # ICH E2E narrative is the only exception that uses headings
+        assert "signal evaluation narrative" in normalized
+
+    def test_system_prompt_response_length_guidance(self):
+        """TONE & STYLE includes response length guidance tied to query complexity."""
+        from adverse_score.orchestrator import system_instructions
+        normalized = " ".join(system_instructions.lower().split())
+        assert "response length should match query complexity" in normalized
+        assert "3-5 sentences" in system_instructions
+        assert "never pad" in normalized
 
 
 class TestSignalNarrativeProtocol:
@@ -1160,8 +1181,8 @@ class TestDeltaDetectionProtocol:
         from adverse_score.orchestrator import system_instructions
         assert "DELTA DETECTION PROTOCOL" in system_instructions
 
-    def test_response_format_includes_score_change(self):
-        """RESPONSE FORMAT includes Score Change vs Prior as item 13."""
+    def test_delta_protocol_includes_score_change(self):
+        """DELTA DETECTION PROTOCOL includes Score Change vs Prior section guidance."""
         from adverse_score.orchestrator import system_instructions
         assert "Score Change vs Prior" in system_instructions
 
