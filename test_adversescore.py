@@ -910,7 +910,7 @@ class TestOrchestratorWiring:
         """System prompt includes the SCOPE ENFORCEMENT block for off-topic deflection."""
         from adverse_score.orchestrator import system_instructions
         assert "SCOPE ENFORCEMENT" in system_instructions
-        assert "I can only assist with pharmaceutical safety analysis" in system_instructions
+        assert "I am designed to only assist with pharmaceutical safety analysis" in system_instructions
 
     def test_system_prompt_contains_diagnosis_lock(self):
         """System prompt includes unconditional DIAGNOSIS LOCK rule (not conditional on a flag)."""
