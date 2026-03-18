@@ -23,7 +23,7 @@ Requires a `.env` file with `OPENFDA_API_KEY` and `OPENAI_API_KEY` (see `.env.ex
 The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validation → AdverseScoreClient → openFDA API → scoring math → JSON payload → LLM response**.
 
 - **`app.py`** — Streamlit chat interface. Passes full conversation history to the agent for multi-turn support. Sets `recursion_limit=10` to prevent runaway agent loops.
-- **`src/adverse_score/orchestrator.py`** — Wires the LangGraph react agent: GPT-4o (temperature=0), system prompt with safety protocols (SCOPE ENFORCEMENT, DIAGNOSIS LOCK, TOOL PROTOCOL), single tool binding.
+- **`src/adverse_score/orchestrator.py`** — Wires the LangGraph react agent: GPT-4o (temperature=0.2), system prompt with safety protocols (SCOPE ENFORCEMENT, DIAGNOSIS LOCK, TOOL PROTOCOL), single tool binding.
 - **`src/adverse_score/agent_tools.py`** — Defines `ClinicalQuerySchema` (Pydantic v2, `extra="forbid"`) and the `@tool`-decorated `get_adverse_score` function. The schema enforces strict types: `Literal["M","F"]` for sex, `ge=1,le=120` for age, `min_length=1` on drug/symptom strings.
 - **`src/adverse_score/client.py`** — Core engine (~720 lines). Handles all openFDA API calls, scoring math, peer benchmarking, and PRR calculation. Key internals:
   - **Severity weights**: DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
