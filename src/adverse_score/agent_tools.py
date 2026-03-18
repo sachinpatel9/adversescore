@@ -90,6 +90,23 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
                 'trend_classification': trend_classification,
             }
 
+        # --- Persistence: save analysis and detect delta vs prior ---
+        try:
+            from .persistence import AnalysisStore
+            store = AnalysisStore()
+            prior = store.get_prior_analysis(drug_name)
+            store.save_analysis(agent_payload)
+            if prior:
+                score_delta = agent_payload["clinical_signal"]["adverse_score"] - prior["adverse_score"]
+                agent_payload["delta_detection"] = {
+                    "prior_score": prior["adverse_score"],
+                    "prior_date": prior["timestamp"],
+                    "score_delta": round(score_delta, 2),
+                }
+            store.close()
+        except (KeyError, TypeError):
+            pass  # Skip persistence for incomplete/error payloads
+
         return json.dumps(agent_payload)
 
     except Exception as e:

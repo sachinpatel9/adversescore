@@ -353,3 +353,15 @@ def sample_agent_payload_with_temporal(sample_agent_payload, sample_time_series_
         "trend_classification": "RISING",
     }
     return sample_agent_payload
+
+
+# ── FIXTURE: Persistence Store (temp SQLite) ─────────────────────────────
+
+@pytest.fixture
+def temp_store(tmp_path):
+    """Provides an AnalysisStore backed by a temporary SQLite DB."""
+    from adverse_score.persistence import AnalysisStore
+    db_path = tmp_path / "test.db"
+    store = AnalysisStore(db_path=db_path)
+    yield store
+    store.close()

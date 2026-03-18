@@ -11,8 +11,10 @@ if src_path not in sys.path:
 
 import streamlit as st
 import streamlit.components.v1 as components
+import pandas as pd
 import plotly.graph_objects as go
 from adverse_score.orchestrator import agent_executor
+from adverse_score.persistence import AnalysisStore
 from langchain_core.messages import HumanMessage, AIMessage
 
 NARRATIVE_KEYWORDS = {"write", "narrative", "document", "report", "summarise", "summarize", "memo", "draft"}
@@ -111,13 +113,81 @@ st.markdown("""
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
+# ── Sidebar: Analysis History ──────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### Analysis History")
+    _store = AnalysisStore()
+    _history = _store.get_history(limit=20)
+    _store.close()
+
+    if not _history:
+        st.caption("No analyses saved yet. Run a drug query to begin.")
+    else:
+        sort_by = st.radio("Sort by", ["Recent", "Drug Name", "Score"],
+                           horizontal=True, label_visibility="collapsed")
+        if sort_by == "Drug Name":
+            _history.sort(key=lambda r: r["drug_name"])
+        elif sort_by == "Score":
+            _history.sort(key=lambda r: r["adverse_score"], reverse=True)
+
+        for _row in _history:
+            _date_short = _row["timestamp"][:10]
+            if st.button(
+                f"{_row['drug_name']} ({_row['adverse_score']:.0f}) — {_date_short}",
+                key=f"hist_{_row['id']}"
+            ):
+                st.session_state["prefill_query"] = f"Analyze {_row['drug_name']}"
+                st.rerun()
+
+    st.divider()
+    if st.button("Compare Portfolio", type="primary", use_container_width=True):
+        st.session_state["show_scorecard"] = True
+        st.rerun()
+
+# ── Comparative Safety Scorecard ───────────────────────────────────────────
+if st.session_state.get("show_scorecard"):
+    st.markdown("### Comparative Safety Scorecard")
+    _store = AnalysisStore()
+    _portfolio = _store.get_portfolio()
+    _store.close()
+
+    if not _portfolio:
+        st.info("No analyses available for comparison.")
+    else:
+        _df = pd.DataFrame(_portfolio)
+        _df = _df[["drug_name", "adverse_score", "prr_value", "confidence_level",
+                    "trend_classification", "label_status"]]
+        _df.columns = ["Drug", "AdverseScore", "PRR", "Confidence", "Trend", "Label Status"]
+        _df["PRR"] = _df["PRR"].apply(lambda v: f"{v:.2f}" if v is not None else "N/A")
+        _df["Trend"] = _df["Trend"].fillna("—")
+
+        def _highlight_high_score(row):
+            if isinstance(row["AdverseScore"], (int, float)) and row["AdverseScore"] > 70:
+                return ["background-color: #ffe0e0"] * len(row)
+            return [""] * len(row)
+
+        styled = _df.style.apply(_highlight_high_score, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    if st.button("Close Scorecard"):
+        st.session_state["show_scorecard"] = False
+        st.rerun()
+
 #Display history
 for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
-#Execution Loop 
-if prompt := st.chat_input('Analyze a drug safety profile....'):
+#Execution Loop
+_prefill = st.session_state.pop("prefill_query", None)
+if _prefill:
+    prompt = _prefill
+elif prompt := st.chat_input('Analyze a drug safety profile....'):
+    pass
+else:
+    prompt = None
+
+if prompt:
     st.session_state.messages.append({'role': 'user', 'content': prompt})
     with st.chat_message('user'):
         st.markdown(prompt)
@@ -161,6 +231,12 @@ if prompt := st.chat_input('Analyze a drug safety profile....'):
                 if narrative_match and message_requests_narrative(prompt):
                     narrative_text = narrative_match.group(1).strip()
                     output = output[:narrative_match.start()].rstrip() + output[narrative_match.end():].lstrip('\n')
+                    # Save narrative to the most recent analysis in the DB
+                    _ns = AnalysisStore()
+                    _latest = _ns.get_history(limit=1)
+                    if _latest:
+                        _ns.update_narrative(_latest[0]["drug_name"], narrative_text)
+                    _ns.close()
                 # Extract time_series JSON for Plotly chart
                 time_series_match = re.search(
                     r'<!-- TIME_SERIES_DATA_START -->\s*(.*?)\s*<!-- TIME_SERIES_DATA_END -->',

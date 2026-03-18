@@ -813,6 +813,86 @@ class TestComputeTrend:
         assert client.compute_trend(data) == "RISING"  # 45 - 35 = 10
 
 
+class TestPersistenceLayer:
+    """Tests for SQLite persistence in persistence.py."""
+
+    def test_save_and_retrieve(self, temp_store, sample_agent_payload):
+        """save_analysis stores a record and get_history retrieves it."""
+        row_id = temp_store.save_analysis(sample_agent_payload)
+        assert row_id >= 1
+        history = temp_store.get_history(limit=5)
+        assert len(history) == 1
+        assert history[0]["drug_name"] == "KEYTRUDA"
+        assert history[0]["adverse_score"] == 45.0
+
+    def test_get_prior_analysis(self, temp_store, sample_agent_payload):
+        """get_prior_analysis returns the most recent prior for a drug."""
+        temp_store.save_analysis(sample_agent_payload)
+        prior = temp_store.get_prior_analysis("KEYTRUDA")
+        assert prior is not None
+        assert prior["drug_name"] == "KEYTRUDA"
+        assert prior["adverse_score"] == 45.0
+
+    def test_get_prior_analysis_case_insensitive(self, temp_store, sample_agent_payload):
+        """get_prior_analysis matches drug names case-insensitively."""
+        temp_store.save_analysis(sample_agent_payload)
+        prior = temp_store.get_prior_analysis("keytruda")
+        assert prior is not None
+        assert prior["drug_name"] == "KEYTRUDA"
+
+    def test_get_prior_analysis_no_match(self, temp_store):
+        """get_prior_analysis returns None for a drug with no history."""
+        prior = temp_store.get_prior_analysis("NONEXISTENT")
+        assert prior is None
+
+    def test_delta_calculation(self, temp_store, sample_agent_payload):
+        """Two saves of the same drug produce ordered history."""
+        temp_store.save_analysis(sample_agent_payload)
+        sample_agent_payload["clinical_signal"]["adverse_score"] = 60.0
+        sample_agent_payload["metadata"]["timestamp"] = "2026-04-01T00:00:00Z"
+        temp_store.save_analysis(sample_agent_payload)
+        history = temp_store.get_history(limit=5)
+        assert len(history) == 2
+        assert history[0]["adverse_score"] == 60.0  # Most recent first
+
+    def test_history_limit(self, temp_store, sample_agent_payload):
+        """get_history respects the limit parameter."""
+        for i in range(25):
+            sample_agent_payload["metadata"]["timestamp"] = f"2026-01-{i+1:02d}T00:00:00Z"
+            temp_store.save_analysis(sample_agent_payload)
+        history = temp_store.get_history(limit=20)
+        assert len(history) == 20
+
+    def test_portfolio_latest_per_drug(self, temp_store, sample_agent_payload):
+        """get_portfolio returns only the latest analysis per drug."""
+        temp_store.save_analysis(sample_agent_payload)
+        sample_agent_payload["clinical_signal"]["adverse_score"] = 55.0
+        sample_agent_payload["metadata"]["timestamp"] = "2026-04-01T00:00:00Z"
+        temp_store.save_analysis(sample_agent_payload)
+        portfolio = temp_store.get_portfolio()
+        assert len(portfolio) == 1
+        assert portfolio[0]["adverse_score"] == 55.0
+
+    def test_payload_with_prr(self, temp_store, sample_agent_payload_with_prr):
+        """save_analysis correctly extracts PRR from pharmacovigilance_metrics."""
+        temp_store.save_analysis(sample_agent_payload_with_prr)
+        history = temp_store.get_history()
+        assert history[0]["prr_value"] == 2.5
+
+    def test_payload_with_temporal(self, temp_store, sample_agent_payload_with_temporal):
+        """save_analysis extracts trend_classification from temporal_analysis."""
+        temp_store.save_analysis(sample_agent_payload_with_temporal)
+        history = temp_store.get_history()
+        assert history[0]["trend_classification"] == "RISING"
+
+    def test_update_narrative(self, temp_store, sample_agent_payload):
+        """update_narrative saves narrative text to the most recent row."""
+        temp_store.save_analysis(sample_agent_payload)
+        temp_store.update_narrative("KEYTRUDA", "Test narrative content")
+        history = temp_store.get_history()
+        assert history[0]["signal_narrative"] == "Test narrative content"
+
+
 # ── SECTION 4: LangGraph Agent Behavior Tests ───────────────────────────────
 # Tests for orchestrator wiring, system prompt compliance, and payload structure.
 
@@ -1070,6 +1150,25 @@ class TestTemporalAnalysisProtocol:
             standard_output, re.DOTALL
         )
         assert match is None
+
+
+class TestDeltaDetectionProtocol:
+    """Tests for the DELTA DETECTION PROTOCOL in the system prompt."""
+
+    def test_system_prompt_contains_delta_protocol(self):
+        """System prompt includes the DELTA DETECTION PROTOCOL section."""
+        from adverse_score.orchestrator import system_instructions
+        assert "DELTA DETECTION PROTOCOL" in system_instructions
+
+    def test_response_format_includes_score_change(self):
+        """RESPONSE FORMAT includes Score Change vs Prior as item 13."""
+        from adverse_score.orchestrator import system_instructions
+        assert "Score Change vs Prior" in system_instructions
+
+    def test_delta_detection_conditional_language(self):
+        """System prompt instructs NOT to include delta when absent."""
+        from adverse_score.orchestrator import system_instructions
+        assert "Do NOT include this section when" in system_instructions
 
 
 class TestPayloadStructure:
