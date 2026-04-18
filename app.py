@@ -655,12 +655,12 @@ if prompt:
                 output, re.DOTALL
             )
             time_series_data = None
-            if time_series_match and message_requests_temporal(prompt):
+            if time_series_match:
+                output = output[:time_series_match.start()].rstrip() + output[time_series_match.end():].lstrip('\n')
                 try:
                     time_series_data = json.loads(time_series_match.group(1).strip())
                 except json.JSONDecodeError:
                     time_series_data = None
-                output = output[:time_series_match.start()].rstrip() + output[time_series_match.end():].lstrip('\n')
 
             # 3. Extract Score Rationale
             rationale_match = re.search(
