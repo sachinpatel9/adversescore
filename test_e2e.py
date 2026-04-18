@@ -376,3 +376,169 @@ class TestAgentE2E:
         assert any(
             term in response.lower() for term in temporal_terms
         ), "Response missing temporal analysis language"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY E: Persistence Layer E2E Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPersistenceE2E:
+    """Validates AnalysisStore context manager protocol and persistence correctness.
+    No API keys required — pure SQLite."""
+
+    def test_analysis_store_context_manager(self, tmp_path, sample_agent_payload):
+        """AnalysisStore context manager commits data and closes connection on exit."""
+        import sqlite3
+        from adverse_score.persistence import AnalysisStore
+
+        db_path = tmp_path / "cm_test.db"
+        with AnalysisStore(db_path=db_path) as store:
+            row_id = store.save_analysis(sample_agent_payload)
+            assert isinstance(row_id, int) and row_id > 0
+
+        # Verify the write was committed before the connection closed
+        verify_conn = sqlite3.connect(str(db_path))
+        cursor = verify_conn.cursor()
+        cursor.execute("SELECT drug_name FROM analyses WHERE id = ?", (row_id,))
+        row = cursor.fetchone()
+        verify_conn.close()
+        assert row is not None
+        assert row[0].upper() == "KEYTRUDA"
+
+    def test_analysis_store_save_incomplete_payload(self, tmp_path):
+        """save_analysis handles Incomplete Data payloads (no label_status) without KeyError."""
+        from adverse_score.persistence import AnalysisStore
+        from datetime import datetime
+
+        # Mirrors the Incomplete Data payload from calculate_final_score
+        incomplete_payload = {
+            "metadata": {
+                "tool_name": "AdverseScore",
+                "timestamp": datetime.now().isoformat() + "Z",
+                "clinical_disclaimer": "Informational use only.",
+            },
+            "clinical_signal": {
+                "drug_target": "ZZZZNOTADRUG",
+                "adverse_score": 0.0,
+                "status": "Incomplete Data",
+                "relative_risk": "Unknown",
+                # label_status and class_benchmark_avg intentionally absent
+            },
+            "data_integrity": {
+                "report_count": 0,
+                "confidence_level": "Insufficient",
+                "defect_ratio": 0.0,
+            },
+            "agent_directives": {
+                "diagnosis_lock": True,
+                "requires_human_review": True,
+                "system_directive": "Insufficient data.",
+            },
+        }
+
+        db_path = tmp_path / "incomplete_test.db"
+        with AnalysisStore(db_path=db_path) as store:
+            row_id = store.save_analysis(incomplete_payload)
+            assert isinstance(row_id, int) and row_id > 0
+            history = store.get_history(limit=1)
+
+        assert len(history) == 1
+        assert history[0]["label_status"] is None
+        assert history[0]["peer_benchmark_avg"] is None
+
+    def test_analysis_store_get_history_insertion_order(self, tmp_path, sample_agent_payload):
+        """get_history returns rows in id DESC order even when timestamps are identical."""
+        import copy
+        from adverse_score.persistence import AnalysisStore
+
+        db_path = tmp_path / "order_test.db"
+        fixed_ts = "2026-01-01T00:00:00Z"
+
+        payload1 = copy.deepcopy(sample_agent_payload)
+        payload1["metadata"]["timestamp"] = fixed_ts
+        payload1["clinical_signal"]["drug_target"] = "DRUGFIRST"
+
+        payload2 = copy.deepcopy(sample_agent_payload)
+        payload2["metadata"]["timestamp"] = fixed_ts
+        payload2["clinical_signal"]["drug_target"] = "DRUGSECOND"
+
+        with AnalysisStore(db_path=db_path) as store:
+            store.save_analysis(payload1)
+            store.save_analysis(payload2)
+            history = store.get_history(limit=2)
+
+        # Most recently inserted row (DRUGSECOND) must be first
+        assert history[0]["drug_name"].upper() == "DRUGSECOND"
+        assert history[1]["drug_name"].upper() == "DRUGFIRST"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY F: Security Regression Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSecurityRegression:
+    """Guards against security regressions introduced during bug fixes."""
+
+    def test_tool_error_payload_excludes_raw_exception(self):
+        """Raw exception text must not appear in the LLM error payload."""
+        from unittest.mock import patch
+        from adverse_score.agent_tools import get_adverse_score
+
+        sentinel = "INTERNAL_SENTINEL_ERROR_XYZ_12345"
+
+        with patch(
+            "adverse_score.client.AdverseScoreClient.fetch_events",
+            side_effect=RuntimeError(sentinel),
+        ):
+            result = get_adverse_score.invoke({"drug_name": "aspirin"})
+
+        payload = json.loads(result)
+        payload_str = json.dumps(payload)
+        assert sentinel not in payload_str, (
+            "Raw exception text was exposed in the LLM payload — security regression"
+        )
+        directive = payload["agent_directives"]["system_directive"]
+        assert "system error" in directive.lower() or "encountered" in directive.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY G: Time-Bounded PRR Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+@SKIP_NO_FDA
+class TestTimeBoundedPRR:
+    """Validates that _calculate_prr_metrics accepts date bounds (Fix 2C)."""
+
+    def test_prr_metrics_with_date_bounds(self, e2e_client):
+        """_calculate_prr_metrics with start_date/end_date returns valid structure or None."""
+        metrics = e2e_client._calculate_prr_metrics(
+            drug_name="aspirin",
+            target_symptom="nausea",
+            start_date="20240101",
+            end_date="20241231",
+        )
+        assert metrics is None or isinstance(metrics, dict), (
+            f"Expected None or dict, got {type(metrics)}"
+        )
+        if metrics is not None:
+            assert "prr" in metrics
+            assert "signal_detected" in metrics
+            assert isinstance(metrics["signal_detected"], bool)
+
+    def test_prr_date_bounds_narrower_than_all_time(self, e2e_client):
+        """A one-year window should return fewer or equal drug cases than all-time."""
+        all_time = e2e_client._calculate_prr_metrics(
+            drug_name="metformin",
+            target_symptom="nausea",
+        )
+        bounded = e2e_client._calculate_prr_metrics(
+            drug_name="metformin",
+            target_symptom="nausea",
+            start_date="20240101",
+            end_date="20241231",
+        )
+        if all_time is None or bounded is None:
+            pytest.skip("Insufficient data for PRR comparison")
+        assert bounded["drug_cases"] <= all_time["drug_cases"], (
+            "Bounded window returned more cases than all-time — date filter not applied"
+        )
