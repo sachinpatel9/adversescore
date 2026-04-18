@@ -274,8 +274,9 @@ class TestLabelAndDiscovery:
         assert client.fetch_label_text("KEYTRUDA") == ""
 
     def test_discover_drug_class_sanitizes_input(self, client, monkeypatch):
-        """Drug name is passed through _sanitize_for_query before embedding in the Lucene search string."""
-        captured_urls = []
+        """Drug name is passed through _sanitize_for_query before embedding in the Lucene search string.
+        Uses params= dict so the escaped value is in kwargs['params']['search'], not the raw URL."""
+        captured_kwargs = []
         class MockResponse:
             status_code = 200
             def json(self):
@@ -283,12 +284,13 @@ class TestLabelAndDiscovery:
             def raise_for_status(self):
                 pass
         def capture_get(url, **kw):
-            captured_urls.append(url)
+            captured_kwargs.append(kw)
             return MockResponse()
         monkeypatch.setattr(client.session, "get", capture_get)
         client._discover_drug_class('DRUG"NAME')
-        # The quote should be escaped in the URL
-        assert '\\"' in captured_urls[0] or '%5C%22' in captured_urls[0]
+        # The escaped quote must appear in the search param value
+        search_param = captured_kwargs[0].get("params", {}).get("search", "")
+        assert '\\"' in search_param
 
     def test_discover_peers_excludes_target_drug(self, client, monkeypatch):
         """The target drug itself is filtered out of the peer list."""

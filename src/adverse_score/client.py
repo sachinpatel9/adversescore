@@ -1,4 +1,5 @@
 import math
+import calendar
 import urllib.parse
 import requests
 from requests.adapters import HTTPAdapter
@@ -98,17 +99,8 @@ class AdverseScoreClient:
                 q_index += 4
                 year -= 1
             month_start = q_index * 3 + 1
-            if q_index == 3:
-                month_end = 12
-                month_end_day = 31
-            else:
-                month_end = (q_index + 1) * 3
-                if month_end in (1, 3, 5, 7, 8, 10, 12):
-                    month_end_day = 31
-                elif month_end == 2:
-                    month_end_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
-                else:
-                    month_end_day = 30
+            month_end = (q_index + 1) * 3 if q_index < 3 else 12
+            month_end_day = calendar.monthrange(year, month_end)[1]
             label = f"{year}-Q{q_index + 1}"
             start = f"{year}{month_start:02d}01"
             end = f"{year}{month_end:02d}{month_end_day:02d}"
@@ -313,15 +305,16 @@ class AdverseScoreClient:
         safe_name = self._sanitize_for_query(target_name)
         search_str = f'patient.drug.openfda.brand_name:"{safe_name}"'
 
-        #safely encode the url to prevent 400 request errors
-        encoded_search = urllib.parse.quote(search_str)
         count_param = "patient.drug.openfda.pharm_class_epc.exact"
 
         try:
-            full_url = f"{url}?search={encoded_search}&count={count_param}&api_key={self.api_key}"
             print(f"[Discovery] Attempting algorithmic class mapping for {target_name}...")
 
-            response = self.session.get(full_url, timeout=10)
+            response = self.session.get(
+                url,
+                params={"search": search_str, "count": count_param, "api_key": self.api_key},
+                timeout=10,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -344,11 +337,13 @@ class AdverseScoreClient:
         url = "https://api.fda.gov/drug/label.json"
         safe_name = self._sanitize_for_query(drug_name)
         search_value = f'openfda.brand_name:"{safe_name}"'
-        encoded_search = urllib.parse.quote(search_value)
 
         try:
-            full_url = f"{url}?search={encoded_search}&limit=5&api_key={self.api_key}"
-            response = self.session.get(full_url, timeout=10)
+            response = self.session.get(
+                url,
+                params={"search": search_value, "limit": 5, "api_key": self.api_key},
+                timeout=10,
+            )
             if response.status_code == 404:
                 return ""
             response.raise_for_status()
@@ -560,7 +555,7 @@ class AdverseScoreClient:
         except Exception:
             return {}
     
-    def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None, label_text: str = "") -> dict: #type: ignore case
+    def _calculate_prr_metrics(self, drug_name: str, pharm_class: str, target_symptom: str, patient_age: int = None, patient_sex: str = None, label_text: str = "", start_date: str = None, end_date: str = None) -> dict: #type: ignore case
         '''
         Executes the PRR ratio calculation and 95% confidence interval math.
 
@@ -576,8 +571,8 @@ class AdverseScoreClient:
         Both are accepted simplifications in automated signal detection systems where
         individual report-level 2x2 tables are impractical to construct from the API.
         '''
-        drug_counts = self._fetch_symptom_counts(drug_name=drug_name, patient_age=patient_age, patient_sex=patient_sex)
-        class_counts = self._fetch_symptom_counts(pharm_class=pharm_class, patient_age=patient_age, patient_sex=patient_sex)
+        drug_counts = self._fetch_symptom_counts(drug_name=drug_name, patient_age=patient_age, patient_sex=patient_sex, start_date=start_date, end_date=end_date)
+        class_counts = self._fetch_symptom_counts(pharm_class=pharm_class, patient_age=patient_age, patient_sex=patient_sex, start_date=start_date, end_date=end_date)
 
         symptom_upper = target_symptom.upper()
 
