@@ -27,7 +27,7 @@ class AdverseScoreClient:
         self.session = self._get_transport_session()
 
 
-    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500, patient_age: int = None, patient_sex: str = None, start_date: str = None, end_date: str = None) -> str:  # type: ignore
+    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500, patient_age: Optional[int] = None, patient_sex: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> str:
         '''
         Constructs a valid openFDA Lucene search query.
         Example output: search=patient.drug.medicinalproduct:'TYLENOL'+AND+receivedate:[20231210+TO+20240310]

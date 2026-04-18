@@ -490,8 +490,8 @@ class TestConfidence:
         assert result["level"] == "Low"
         assert result["metric"] == 40.0
 
-    def test_confidence_medium_sample(self, math_client):
-        """50-79 reports → base confidence 90.0 (with no defects)."""
+    def test_confidence_high_from_medium_sample(self, math_client):
+        """50-79 reports → base confidence 90.0 → maps to 'High' confidence level."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(60)]
         result = math_client._calculate_confidence(reports)
         assert result["level"] == "High"

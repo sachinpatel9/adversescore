@@ -45,6 +45,7 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - **URL encoding in `client.py`**: `_discover_drug_class` and `_fetch_label_class_fallback` pass query parameters via `params=` dict to `session.get()` — do not use `urllib.parse.quote` manually. The `requests` library handles encoding. Drug/class names are still routed through `_sanitize_for_query()` before being embedded in Lucene field strings.
 - **`_calculate_prr_metrics`** accepts optional `start_date` and `end_date` parameters and passes them through to `_fetch_symptom_counts`. Use these when computing time-bounded PRR (e.g. per-quarter temporal analysis).
 - **Narrative drug name attribution** in `app.py`: after the agent returns, `st.session_state["last_analyzed_drug"]` is populated from the tool's JSON payload (`clinical_signal.drug_target`). The narrative save block uses this key — do not re-query `get_history(limit=1)` as that is a race condition in concurrent sessions.
+- **`build_query` type hints**: `patient_age`, `patient_sex`, `start_date`, and `end_date` are all typed as `Optional[...]` — do not use bare `int = None` or `str = None` which suppress type checking.
 
 ## Test Suite
 
