@@ -152,7 +152,7 @@ class AdverseScoreClient:
                 a_plus_b = sum(drug_counts.values()) or 1
                 c = class_counts.get(target_symptom.upper(), 0)
                 c_plus_d = sum(class_counts.values()) or 1
-                if a >= 3 and c_plus_d > 0 and a_plus_b > 0:
+                if a >= 3 and c > 0 and c_plus_d > 0 and a_plus_b > 0:
                     prr_value = round((a / a_plus_b) / (c / c_plus_d), 2)
 
             time_series.append({
@@ -377,8 +377,8 @@ class AdverseScoreClient:
         print(f"[Discovery] Pharmacologic Class Identified: {pharm_class}")
         url = "https://api.fda.gov/drug/event.json"
 
-        #clean the class name for the URL
-        clean_class = pharm_class.replace(' ', '+').replace('"', '')
+        #clean the class name for the URL — must go through _sanitize_for_query per the security invariant
+        clean_class = self._sanitize_for_query(pharm_class).replace(' ', '+')
         query = f'search=patient.drug.openfda.pharm_class_epc:"{clean_class}"&count=patient.drug.medicinalproduct.exact'
 
         try:

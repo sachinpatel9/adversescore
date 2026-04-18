@@ -900,6 +900,35 @@ class TestPersistenceLayer:
 class TestOrchestratorWiring:
     """Tests that the agent executor is correctly configured."""
 
+    def test_uses_create_agent_import(self):
+        """orchestrator imports create_agent from langchain.agents (the current stable API)."""
+        import inspect
+        import adverse_score.orchestrator as orch_module
+        assert hasattr(orch_module, "create_agent"), (
+            "create_agent must be imported from langchain.agents into orchestrator"
+        )
+        source = inspect.getsource(orch_module)
+        assert "from langchain.agents import create_agent" in source
+        assert "from langgraph.prebuilt import create_react_agent" not in source
+
+    def test_agent_executor_instantiated_with_create_agent(self):
+        """agent_executor is built with create_agent (langchain.agents), not the deprecated langgraph.prebuilt spelling."""
+        import inspect
+        import adverse_score.orchestrator as orch_module
+        source = inspect.getsource(orch_module)
+        assert "create_agent(" in source
+        assert "create_react_agent(" not in source
+
+    def test_agent_executor_uses_system_prompt_kwarg(self):
+        """agent_executor passes 'system_prompt=' kwarg, matching create_agent's API (not bare 'prompt=')."""
+        import re
+        import inspect
+        import adverse_score.orchestrator as orch_module
+        source = inspect.getsource(orch_module)
+        assert "system_prompt=system_instructions" in source
+        # Ensure no bare `prompt=` kwarg (i.e. not preceded by 'system_')
+        assert not re.search(r'(?<!system_)prompt=system_instructions', source)
+
     def test_agent_executor_has_tool_bound(self):
         """agent_executor has get_adverse_score in its available tools."""
         from adverse_score.orchestrator import tools
@@ -1313,7 +1342,8 @@ class TestAgentToolBehavior:
                "insufficient" in result["agent_directives"]["system_directive"].lower()
 
     def test_tool_returns_error_payload_on_exception(self):
-        """When the client raises an exception, the tool returns a structured error payload (not a traceback)."""
+        """When the client raises an exception, the tool returns a structured error payload (not a traceback).
+        The raw exception message must NOT appear in the payload to prevent internal detail exposure."""
         from unittest.mock import MagicMock
         from adverse_score import agent_tools
 
@@ -1324,7 +1354,10 @@ class TestAgentToolBehavior:
         assert result["metadata"]["status"] == "System Error"
         assert "clinical_disclaimer" in result["metadata"]
         assert result["agent_directives"]["diagnosis_lock"] is True
-        assert "database connection lost" in result["agent_directives"]["system_directive"]
+        # Raw exception text must NOT be in the payload (security: no internal detail exposure)
+        assert "database connection lost" not in result["agent_directives"]["system_directive"]
+        # Generic user-facing message must be present
+        assert "system error" in result["agent_directives"]["system_directive"].lower()
 
     def test_tool_output_has_all_required_top_level_keys(self):
         """A successful tool response contains metadata, clinical_signal, data_integrity, and agent_directives."""

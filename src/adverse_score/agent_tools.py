@@ -104,12 +104,13 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
                     "score_delta": round(score_delta, 2),
                 }
             store.close()
-        except (KeyError, TypeError):
-            pass  # Skip persistence for incomplete/error payloads
+        except Exception:
+            pass  # Skip persistence for incomplete/error payloads — never mask a successful score
 
         return json.dumps(agent_payload)
 
     except Exception as e:
+        print(f"[AdverseScore] Tool error: {e}")
         error_payload = {
             'metadata': {
                 'tool_name': 'AdverseScore',
@@ -120,7 +121,7 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
                 'diagnosis_lock': True,
                 'requires_human_review': False,
                 'route_to_specialist': False,
-                'system_directive': f'Inform the user that the AdverseScore tool encountered a system error and could not complete the analysis. Internal Error: {str(e)}'
+                'system_directive': 'Inform the user that the AdverseScore tool encountered a system error and could not complete the analysis. Please try again or contact support.'
             }
         }
         return json.dumps(error_payload)
