@@ -66,10 +66,10 @@ class AnalysisStore:
                 metadata["timestamp"],
                 clinical["adverse_score"],
                 prr_value,
-                clinical["class_benchmark_avg"],
+                clinical.get("class_benchmark_avg"),
                 integrity["confidence_level"],
                 trend,
-                clinical["label_status"],
+                clinical.get("label_status"),
                 integrity["report_count"],
             ),
         )
@@ -77,10 +77,10 @@ class AnalysisStore:
         return cursor.lastrowid
 
     def get_history(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Return the most recent analyses, ordered by timestamp DESC."""
+        """Return the most recent analyses by insertion order (id DESC)."""
         cursor = self._conn.cursor()
         cursor.execute(
-            "SELECT * FROM analyses ORDER BY timestamp DESC LIMIT ?", (limit,)
+            "SELECT * FROM analyses ORDER BY id DESC LIMIT ?", (limit,)
         )
         return [dict(row) for row in cursor.fetchall()]
 
@@ -117,6 +117,12 @@ class AnalysisStore:
             (narrative, drug_name),
         )
         self._conn.commit()
+
+    def __enter__(self) -> "AnalysisStore":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def close(self) -> None:
         self._conn.close()
