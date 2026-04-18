@@ -601,6 +601,21 @@ if prompt:
                 )
                 output = response['messages'][-1].content
 
+                # Extract the analyzed drug name from the tool payload so the narrative
+                # save block has a reliable source that is immune to DB race conditions.
+                st.session_state["last_analyzed_drug"] = None
+                for _msg in response['messages']:
+                    _content = getattr(_msg, 'content', '')
+                    if isinstance(_content, str) and '"drug_target"' in _content:
+                        try:
+                            _payload = json.loads(_content)
+                            _drug = _payload.get('clinical_signal', {}).get('drug_target')
+                            if _drug:
+                                st.session_state["last_analyzed_drug"] = _drug
+                                break
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
                 status.update(label="Analysis complete", state="complete", expanded=False)
 
             except Exception as e:
@@ -629,11 +644,10 @@ if prompt:
             if narrative_match and message_requests_narrative(prompt):
                 narrative_text = narrative_match.group(1).strip()
                 output = output[:narrative_match.start()].rstrip() + output[narrative_match.end():].lstrip('\n')
-                _ns = AnalysisStore()
-                _latest = _ns.get_history(limit=1)
-                if _latest:
-                    _ns.update_narrative(_latest[0]["drug_name"], narrative_text)
-                _ns.close()
+                _analyzed_drug = st.session_state.get("last_analyzed_drug")
+                if _analyzed_drug:
+                    with AnalysisStore() as _ns:
+                        _ns.update_narrative(_analyzed_drug, narrative_text)
 
             # 2. Extract time_series JSON
             time_series_match = re.search(
