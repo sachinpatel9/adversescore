@@ -191,8 +191,8 @@ tools = [get_adverse_score]
 
 #create the executor
 agent_executor = create_agent(
-    model=llm, 
-    tools=tools, 
+    model=llm,
+    tools=tools,
     system_prompt=system_instructions
 )
 
