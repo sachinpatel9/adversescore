@@ -38,9 +38,10 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 
 - All query-building methods must call `_sanitize_for_query()` before embedding values in Lucene strings. This is a security invariant — check it when adding new FDA queries.
 - openFDA sex codes: **1=Male, 2=Female**. This was previously inverted and is a common source of bugs.
-- The agent's error payload must include `clinical_disclaimer`, `diagnosis_lock`, `requires_human_review`, and `system_directive` — the system prompt rules depend on these fields being present in all payloads.
+- The agent's error payload must include `clinical_disclaimer`, `diagnosis_lock`, `requires_human_review`, and `system_directive` — the system prompt rules depend on these fields being present in all payloads. The raw exception message must **never** appear in the payload; log it server-side via `print()` only.
 - Peers with zero adverse event data are excluded from benchmark averages to prevent artificial score deflation.
 - A pre-commit hook in `.git/hooks/pre-commit` blocks `.env` files and scans for API key patterns.
+- **`AnalysisStore` (persistence.py)** supports the context manager protocol — prefer `with AnalysisStore() as store:` over manual `.close()` to guarantee connection cleanup on exceptions. `save_analysis` uses `.get()` for optional fields (`label_status`, `class_benchmark_avg`) and is safe to call on Incomplete Data payloads. `get_history` orders by `id DESC` (insertion order) so the most recently saved row is always first regardless of the timestamp value stored.
 
 ## Test Suite
 
