@@ -34,6 +34,64 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
   - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top 3 peers, averages their scores
 - **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast).
 
+## Workflow Orchestration 
+
+### 1. Plan Node Default
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something does not work, STOP and re-plan immediately - do not keep pushing forward
+- Use plan mode for verification steps, not just building the codebase
+- Write detailed specs upfront to reduce ambiguity 
+- Use AskUserQuestion tool when appropriate to pressure test on all possible requirements for any updates or new additions to the codebase 
+
+### 2. Subagent Strategy
+- Use subagents liberally to manage context and keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, use more compute via subagents 
+- Assign only one task per subagent for focused execution 
+
+### 3. Self-Improvement Loop 
+- Write rules for yourself that prevent the same mistakes and add them to CLAUDE.md as a reminder to yourself 
+
+### 4. Verification Before Done
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this change?"
+- Run tests, check logs, demonstrate accuracy
+
+### 5. Demand Elegance (Balanced)
+- For non-trivial changes: pause and ask 'is there a more elegant way?'
+- If a fix increases complexity of the codebase without a gain in efficiency and performance, then do not make the change
+- Skip this for simple, obvious fixes - do not over-engineer
+- Challenge your own work before presenting it
+
+### 6. Autonomous Big Fixing 
+- When given a big report: just fix it. Do not ask for hand-holding 
+- Point at logs, errors, and failing tests - then resolve them
+- Zero context switching required from the user
+- Fix failing CI tests without being told how
+- If existing unit and E2E test files do not exist, write and maintain appending the files with new tests that are important to run as the codebase gets built but avoid redundancy 
+
+## Task Management
+
+1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
+2. **Verify Plan**: Check in with me before starting implementation
+3. **Track Progress**: Mark items complete as you go
+4. **Explain Changes**: High-level summary at each step
+5. **Document Results**: Add review section to `tasks/todo.md`
+
+## Core Principles
+
+- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards must be followed.
+- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+
+
+
+
+
+
+
 ## Key Design Decisions
 
 - All query-building methods must call `_sanitize_for_query()` before embedding values in Lucene strings. This is a security invariant — check it when adding new FDA queries.
