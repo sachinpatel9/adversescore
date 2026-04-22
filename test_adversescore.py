@@ -16,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from adverse_score.agent_tools import ClinicalQuerySchema
 from adverse_score.client import AdverseScoreClient
+from adverse_score.label_classifier import calculate_label_penalty, classify_label_status
+from adverse_score.scoring import (calculate_report_score, calculate_confidence,
+                                   generate_guardrails, SEVERITY_WEIGHTS)
+from adverse_score.prr import calculate_prr
 
 
 # ── SECTION 1: Pydantic Model Validation Tests ──────────────────────────────
@@ -219,6 +223,36 @@ class TestFetchEvents:
         monkeypatch.setattr(client.session, "get", raise_error)
         result = client.fetch_events("KEYTRUDA")
         assert result is None
+
+    def test_fetch_events_retries_on_connection_error(self, client, monkeypatch):
+        """tenacity retries transient ConnectionError before propagating failure."""
+        import requests
+        call_count = {"n": 0}
+        def flaky_get(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise requests.exceptions.ConnectionError("transient")
+            class OKResponse:
+                status_code = 200
+                def json(self): return {"results": []}
+                def raise_for_status(self): pass
+            return OKResponse()
+        monkeypatch.setattr(client.session, "get", flaky_get)
+        result = client.fetch_events("TESTDRUG")
+        assert result is not None
+        assert call_count["n"] == 3  # 2 failures + 1 success
+
+    def test_fetch_events_exhausts_retries(self, client, monkeypatch):
+        """After 3 failed attempts, tenacity stops and the method returns None."""
+        import requests
+        call_count = {"n": 0}
+        def always_fail(*a, **kw):
+            call_count["n"] += 1
+            raise requests.exceptions.ConnectionError("persistent")
+        monkeypatch.setattr(client.session, "get", always_fail)
+        result = client.fetch_events("TESTDRUG")
+        assert result is None
+        assert call_count["n"] == 3
 
 
 class TestFlattenResults:
@@ -483,22 +517,22 @@ class TestConfidence:
         assert result["metric"] == 0.0
         assert result["defect_ratio"] == 0.0
 
-    def test_confidence_low_sample(self, math_client):
-        """Fewer than 50 reports → base confidence 40.0 (with no defects)."""
+    def test_confidence_small_sample(self, math_client):
+        """10 clean reports → continuous curve produces 'Medium' confidence."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(10)]
         result = math_client._calculate_confidence(reports)
-        assert result["level"] == "Low"
-        assert result["metric"] == 40.0
+        assert result["level"] == "Medium"
+        assert result["metric"] == 72.7
 
-    def test_confidence_high_from_medium_sample(self, math_client):
-        """50-79 reports → base confidence 90.0 → maps to 'High' confidence level."""
+    def test_confidence_medium_sample(self, math_client):
+        """60 clean reports → continuous curve produces 'High' confidence."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(60)]
         result = math_client._calculate_confidence(reports)
         assert result["level"] == "High"
-        assert result["metric"] == 90.0
+        assert result["metric"] == 96.1
 
     def test_confidence_high_sample(self, math_client):
-        """80+ reports → base confidence 100.0 (with no defects)."""
+        """100+ reports → curve saturates at 100.0."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(100)]
         result = math_client._calculate_confidence(reports)
         assert result["level"] == "High"
@@ -510,17 +544,18 @@ class TestConfidence:
         good = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(5)]
         bad = [{"date": None, "symptoms": "NAUSEA"} for _ in range(5)]
         result = math_client._calculate_confidence(good + bad)
-        # base=40 (10 reports < 50), penalty=0.5*50=25, final=40-25=15
-        assert result["metric"] == 15.0
+        # base=72.7 (log-linear for n=10), penalty=0.5*50=25, final=72.7-25=47.7
+        assert result["metric"] == 47.7
         assert result["defect_ratio"] == 0.5
         assert result["level"] == "Low"
 
     def test_confidence_all_defective(self, math_client):
-        """All reports defective → confidence floors at 0.0 (not negative)."""
+        """All reports defective → penalty exceeds base, score floors above 0."""
         reports = [{"date": None, "symptoms": "Unknown"} for _ in range(10)]
         result = math_client._calculate_confidence(reports)
-        # base=40, defect_ratio=1.0, penalty=50, final=max(0, 40-50)=0.0
-        assert result["metric"] == 0.0
+        # base=72.7, defect_ratio=1.0, penalty=50, final=max(0, 72.7-50)=22.7
+        assert result["metric"] == 22.7
+        assert result["level"] == "None"
 
     def test_confidence_unknown_symptoms_counted(self, math_client):
         """Reports with symptoms='Unknown' are counted as defects."""
@@ -528,12 +563,15 @@ class TestConfidence:
         result = math_client._calculate_confidence(reports)
         assert result["defect_ratio"] == 1.0
 
-    def test_confidence_boundary_49_vs_50(self, math_client):
-        """49 reports → base 40.0, 50 reports → base 90.0 (step function boundary)."""
+    def test_confidence_continuous_curve_no_cliff(self, math_client):
+        """49 and 50 reports produce nearly identical scores (no step-function cliff)."""
         reports_49 = [{"date": "20260101", "symptoms": "X"} for _ in range(49)]
         reports_50 = [{"date": "20260101", "symptoms": "X"} for _ in range(50)]
-        assert math_client._calculate_confidence(reports_49)["metric"] == 40.0
-        assert math_client._calculate_confidence(reports_50)["metric"] == 90.0
+        metric_49 = math_client._calculate_confidence(reports_49)["metric"]
+        metric_50 = math_client._calculate_confidence(reports_50)["metric"]
+        assert abs(metric_49 - metric_50) < 1.0
+        assert math_client._calculate_confidence(reports_49)["level"] == "High"
+        assert math_client._calculate_confidence(reports_50)["level"] == "High"
 
 
 class TestFinalScore:
@@ -596,32 +634,26 @@ class TestFinalScore:
 
 
 class TestPRR:
-    """Tests for _calculate_prr_metrics() — Proportional Reporting Ratio.
+    """Tests for calculate_prr() — pure PRR + Wald 95% CI math.
 
-    Since _calculate_prr_metrics calls _fetch_symptom_counts (which hits the FDA API),
-    we test the math by calling the method with mocked return values via monkeypatch.
+    Tests call calculate_prr directly with pre-computed count dicts — no mocking needed.
     """
 
-    def test_prr_division_by_zero_guard(self, math_client, monkeypatch):
+    def test_prr_division_by_zero_guard(self):
         """Returns prr=0.0 and signal_detected=False when denominators are zero."""
-        # Both drug and class have no symptoms at all → a+b=0, c+d=0
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", lambda **kwargs: {})
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        result = calculate_prr({}, {}, "NAUSEA")
         assert result["prr"] == 0.0
         assert result["signal_detected"] is False
 
-    def test_prr_insufficient_cases_guard(self, math_client, monkeypatch):
+    def test_prr_insufficient_cases_guard(self):
         """Returns signal_detected=False when drug cases (a) < 3."""
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 2, "HEADACHE": 10}  # a=2, a+b=12
-            return {"NAUSEA": 100, "HEADACHE": 500}     # c=100, c+d=600
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 2, "HEADACHE": 10}
+        class_counts = {"NAUSEA": 100, "HEADACHE": 500}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
         assert result["signal_detected"] is False
         assert result["drug_cases"] == 2
 
-    def test_prr_known_values(self, math_client, monkeypatch):
+    def test_prr_known_values(self):
         """PRR matches hand-computed value for a controlled 2x2 contingency table.
 
         Setup:
@@ -631,15 +663,10 @@ class TestPRR:
           c+d = total class symptoms = 1220
         PRR = (a/(a+b)) / (c/(c+d)) = (50/110) / (500/1220) = 0.45454... / 0.40983... = 1.1090...
         """
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
-            return {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
+        drug_counts = {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
+        class_counts = {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
 
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
-
-        # Hand computation
         a, a_plus_b = 50, 110
         c, c_plus_d = 500, 1220
         expected_prr = (a / a_plus_b) / (c / c_plus_d)
@@ -647,18 +674,14 @@ class TestPRR:
         assert result["drug_cases"] == 50
         assert result["class_cases"] == 500
 
-    def test_prr_ci_lower_bound(self, math_client, monkeypatch):
+    def test_prr_ci_lower_bound(self):
         """CI lower bound uses the Wald formula: exp(ln(PRR) - 1.96 * SE).
 
         SE = sqrt(1/a - 1/(a+b) + 1/c - 1/(c+d))
         """
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
-            return {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
+        class_counts = {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
 
         a, a_plus_b = 50, 110
         c, c_plus_d = 500, 1220
@@ -668,31 +691,22 @@ class TestPRR:
 
         assert result["ci_lower"] == round(expected_ci, 2)
 
-    def test_prr_strong_signal_detected(self, math_client, monkeypatch):
+    def test_prr_strong_signal_detected(self):
         """When CI lower > 1.0 and a >= 3, signal_detected is True."""
-        # Make the drug have a disproportionately high symptom rate
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"HEPATOTOXICITY": 100, "OTHER": 50}  # a=100, a+b=150
-            return {"HEPATOTOXICITY": 50, "OTHER": 5000}      # c=50, c+d=5050
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "HEPATOTOXICITY")
+        drug_counts = {"HEPATOTOXICITY": 100, "OTHER": 50}
+        class_counts = {"HEPATOTOXICITY": 50, "OTHER": 5000}
+        result = calculate_prr(drug_counts, class_counts, "HEPATOTOXICITY")
 
         # PRR = (100/150) / (50/5050) = 0.6667 / 0.0099 ≈ 67.3 → very strong signal
         assert result["signal_detected"] is True
         assert result["prr"] > 1.0
         assert result["ci_lower"] > 1.0
 
-    def test_prr_class_zero_target_symptom(self, math_client, monkeypatch):
+    def test_prr_class_zero_target_symptom(self):
         """When class has zero cases of the target symptom (c=0), guard returns prr=0.0."""
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 10, "HEADACHE": 5}
-            return {"HEADACHE": 100}  # no NAUSEA at all → c=0
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 10, "HEADACHE": 5}
+        class_counts = {"HEADACHE": 100}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
         assert result["prr"] == 0.0
         assert result["signal_detected"] is False
 
@@ -1506,23 +1520,20 @@ class TestBoundaryConditions:
         query_old = client.build_query("X", patient_age=120)
         assert "[115+TO+125]" in query_old
 
-    def test_recency_decay_boundary(self, math_client, monkeypatch):
-        """Report 89 days ago gets decay 1.0; 91 days ago gets 0.5 (90-day boundary)."""
-        day_recent = (datetime.now() - timedelta(days=89)).strftime("%Y%m%d")
-        day_old = (datetime.now() - timedelta(days=91)).strftime("%Y%m%d")
-        # Use non-serious + labeled to avoid hitting the 100 cap
+    def test_recency_decay_smooth(self, math_client, monkeypatch):
+        """Exponential decay: 89 and 91 day scores are nearly identical (no cliff)."""
+        day_89 = (datetime.now() - timedelta(days=89)).strftime("%Y%m%d")
+        day_91 = (datetime.now() - timedelta(days=91)).strftime("%Y%m%d")
         report_template = {"severity": "Non-Serious", "is_death": False, "is_hospitalization": False, "symptoms": "headache"}
-        reports_recent = [{**report_template, "date": day_recent}]
-        reports_old = [{**report_template, "date": day_old}]
+        reports_89 = [{**report_template, "date": day_89}]
+        reports_91 = [{**report_template, "date": day_91}]
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
-        r_recent = math_client.calculate_final_score("TEST", reports_recent, skip_benchmark=True)
-        r_old = math_client.calculate_final_score("TEST", reports_old, skip_benchmark=True)
-        score_recent = r_recent["clinical_signal"]["adverse_score"]
-        score_old = r_old["clinical_signal"]["adverse_score"]
-        # NON_SERIOUS(0.25) * labeled(1.0) * decay * 40
-        # Recent: 0.25 * 1.0 * 40 = 10.0, Old: 0.25 * 0.5 * 40 = 5.0
-        assert score_recent == 10.0
-        assert score_old == 5.0
+        score_89 = math_client.calculate_final_score("TEST", reports_89, skip_benchmark=True)["clinical_signal"]["adverse_score"]
+        score_91 = math_client.calculate_final_score("TEST", reports_91, skip_benchmark=True)["clinical_signal"]["adverse_score"]
+        # Exponential decay: 89d ≈ 0.504, 91d ≈ 0.496 — scores differ by < 0.5
+        assert abs(score_89 - score_91) < 0.5
+        assert score_89 > 0
+        assert score_91 > 0
 
     def test_score_all_death_unlabeled_recent(self, math_client, monkeypatch):
         """Maximum theoretical input (all death + unlabeled + recent) → score capped at 100."""
@@ -1537,7 +1548,7 @@ class TestBoundaryConditions:
         assert result["clinical_signal"]["adverse_score"] == 100
 
     def test_score_all_non_serious_labeled_old(self, math_client, monkeypatch):
-        """Minimum theoretical input (all non-serious + labeled + old) → score = 5.0."""
+        """Minimum theoretical input (all non-serious + labeled + 180 days old) → score = 2.5."""
         old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
         reports = [
             {"date": old_date, "severity": "Non-Serious", "is_death": False,
@@ -1547,8 +1558,8 @@ class TestBoundaryConditions:
         # Label text contains "headache" so penalty is 1.0
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache, nausea, fatigue")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.5 (old) * 40 = 5.0
-        assert result["clinical_signal"]["adverse_score"] == 5.0
+        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.25 (180d exponential decay) * 40 = 2.5
+        assert result["clinical_signal"]["adverse_score"] == 2.5
 
     def test_concurrent_severity_tiers(self, math_client, monkeypatch):
         """Mixed severity reports produce a weighted average between the individual tier scores."""

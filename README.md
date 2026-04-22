@@ -10,13 +10,24 @@ Unlike traditional tools that rely on hardcoded drug dictionaries, AdverseScore 
 
 ### 2. Disproportionality Analysis (PRR & 95% CI)
 At its core, the AI-powered system implements a **Proportional Reporting Ratio**.
-- **Statistical Grounding:** Calculates the PRR to detect signals that are disproportionately frequent in a specific drug compared to its pharmacologic class
+- **Statistical Grounding:** Calculates the PRR to detect signals that are disproportionately frequent in a specific drug compared to its pharmacologic class.
 - **Confidence Intervals:** Computes the 95% Confidence Interval (CI) lower bound to ensure clinical signals are statistically significant ($a \ge 3$ and $CI_{lower} > 1.0$) before alerting the user.
 
-### 3. Agentic Orchestration with LangGraph
+### 3. Modular Scoring Engine
+The scoring pipeline is decomposed into focused, independently testable modules:
+- **Severity-Weighted Scoring** — Four-tier weighting based on ICH E2D seriousness criteria (Death 1.75x, Hospitalization 1.0x, Other Serious 0.75x, Non-Serious 0.25x), amplified by label penalty multipliers for unlabeled signals (up to 2.0x).
+- **Exponential Recency Decay** — Reports are weighted by an exponential half-life model (`exp(-0.693 * days / 90)`), producing smooth degradation: full weight at day 0, half at 90 days, quarter at 180 days. This replaces a binary 90-day cliff that created an indefensible discontinuity.
+- **Continuous Log-Linear Confidence** — Data reliability is scored via a continuous curve (`min(100, 40 + 60 * log1p(N) / log1p(80))`) with a quality penalty for defective reports. This eliminates step-function cliffs at arbitrary sample size thresholds.
+- **Centralized Configuration** — All scoring constants, guardrail thresholds, API timeouts, and retry parameters are defined as named constants in `config.py` with inline clinical rationale, making the engine fully auditable and tunable without code changes.
+
+### 4. Agentic Orchestration with LangGraph
 Built on a **LangGraph** architecture, the system utilizes a state-aware agent to:
 - **Natural Language Extraction:** Uses Pydantic schemas to isolate target symptoms and patient demographics (Age/Sex) from unstructured clinical prompts.
 - **Deterministic Guardrails:** Controls LLM behavior through Python-level booleans. If the mathematical engine detects a high-risk signal, the agent is programmatically forced into a "Human Review" fallback state, bypassing its generative autonomy.
+
+### 5. Production-Grade Resilience
+- **Dual-Layer HTTP Retry** — All FDA API calls are protected by two complementary retry mechanisms: urllib3 `Retry` for transport-level status code retries (429/5xx) and tenacity exponential backoff for application-level transient failures (timeouts, DNS, connection resets).
+- **Structured JSON Logging** — Every FDA API call, scoring computation, guardrail decision, and agent invocation emits a structured JSON log entry to stderr, enabling machine-parseable observability without polluting stdout.
 
 
 ## Product Capabilities
@@ -61,21 +72,28 @@ All persisted data is local to the machine. No cloud storage, no PII, no patient
 
 ## System Architecture
 
+The execution flow is: **Streamlit UI -> LangGraph Agent -> Pydantic Validation -> AdverseScoreClient -> FDAClient (openFDA API) -> Scoring/PRR/Label Modules -> JSON Payload -> LLM Response**.
+
 ```text
 adversescore/
 ├── app.py                        # Streamlit chat UI with sidebar history & scorecard
 ├── src/
 │   └── adverse_score/
-│       ├── client.py             # Core engine: FDA API, scoring math, PRR, label detection, temporal analysis
+│       ├── config.py             # API key validation + all named scoring/API constants
+│       ├── fda_client.py         # openFDA HTTP client with dual-layer retry (urllib3 + tenacity)
+│       ├── client.py             # Thin orchestrator: coordinates FDAClient with scoring modules
+│       ├── scoring.py            # Pure scoring math: severity weights, confidence, guardrails
+│       ├── prr.py                # PRR + Wald 95% CI calculation (pure math, no HTTP)
+│       ├── label_classifier.py   # Label penalty + LABELED/UNLABELED classification
 │       ├── agent_tools.py        # Pydantic schema + @tool function with persistence integration
 │       ├── orchestrator.py       # LangGraph agent, system prompt, safety protocols
 │       ├── persistence.py        # SQLite persistence layer (AnalysisStore)
-│       └── config.py             # Environment & API key validation
+│       └── logger.py             # JSON-structured logging to stderr
 ├── data/                         # SQLite DB (auto-created, gitignored)
 ├── docs/                         # Product Requirements Document
 ├── conftest.py                   # Pytest fixtures (unit + E2E)
-├── test_adversescore.py          # Unit test suite (153 tests)
-├── test_e2e.py                   # E2E integration tests (29 tests, live API)
+├── test_adversescore.py          # Unit test suite (158 tests)
+├── test_e2e.py                   # E2E integration tests (35 tests, live API)
 ├── pytest.ini                    # Pytest configuration & marker registration
 ├── requirements.txt              # Dependencies
 └── .env                          # API keys (gitignored)
@@ -98,7 +116,7 @@ Unlike standard LLM implementations, AdverseScore enforces multiple layers of sa
 
 ### Prerequisites
 * Python 3.10+
-* openFDA API Key
+* openFDA API Key ([request here](https://open.fda.gov/apis/authentication/))
 * OpenAI API Key (GPT-4o)
 
 ### Installation
@@ -130,10 +148,10 @@ The `data/` directory for SQLite persistence is created automatically on first r
 
 ### Running Tests
 ```bash
-# Unit tests (no API keys required, runs in ~4 seconds)
+# Unit tests (no API keys required, ~15 seconds)
 python -m pytest test_adversescore.py -v
 
-# E2E integration tests (requires API keys in .env, ~10-15 minutes)
+# E2E integration tests (requires API keys in .env)
 python -m pytest test_e2e.py -v -m e2e
 
 # Full suite
