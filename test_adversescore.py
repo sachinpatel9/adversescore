@@ -16,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from adverse_score.agent_tools import ClinicalQuerySchema
 from adverse_score.client import AdverseScoreClient
+from adverse_score.label_classifier import calculate_label_penalty, classify_label_status
+from adverse_score.scoring import (calculate_report_score, calculate_confidence,
+                                   generate_guardrails, SEVERITY_WEIGHTS)
+from adverse_score.prr import calculate_prr
 
 
 # ── SECTION 1: Pydantic Model Validation Tests ──────────────────────────────
@@ -596,32 +600,26 @@ class TestFinalScore:
 
 
 class TestPRR:
-    """Tests for _calculate_prr_metrics() — Proportional Reporting Ratio.
+    """Tests for calculate_prr() — pure PRR + Wald 95% CI math.
 
-    Since _calculate_prr_metrics calls _fetch_symptom_counts (which hits the FDA API),
-    we test the math by calling the method with mocked return values via monkeypatch.
+    Tests call calculate_prr directly with pre-computed count dicts — no mocking needed.
     """
 
-    def test_prr_division_by_zero_guard(self, math_client, monkeypatch):
+    def test_prr_division_by_zero_guard(self):
         """Returns prr=0.0 and signal_detected=False when denominators are zero."""
-        # Both drug and class have no symptoms at all → a+b=0, c+d=0
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", lambda **kwargs: {})
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        result = calculate_prr({}, {}, "NAUSEA")
         assert result["prr"] == 0.0
         assert result["signal_detected"] is False
 
-    def test_prr_insufficient_cases_guard(self, math_client, monkeypatch):
+    def test_prr_insufficient_cases_guard(self):
         """Returns signal_detected=False when drug cases (a) < 3."""
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 2, "HEADACHE": 10}  # a=2, a+b=12
-            return {"NAUSEA": 100, "HEADACHE": 500}     # c=100, c+d=600
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 2, "HEADACHE": 10}
+        class_counts = {"NAUSEA": 100, "HEADACHE": 500}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
         assert result["signal_detected"] is False
         assert result["drug_cases"] == 2
 
-    def test_prr_known_values(self, math_client, monkeypatch):
+    def test_prr_known_values(self):
         """PRR matches hand-computed value for a controlled 2x2 contingency table.
 
         Setup:
@@ -631,15 +629,10 @@ class TestPRR:
           c+d = total class symptoms = 1220
         PRR = (a/(a+b)) / (c/(c+d)) = (50/110) / (500/1220) = 0.45454... / 0.40983... = 1.1090...
         """
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
-            return {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
+        drug_counts = {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
+        class_counts = {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
 
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
-
-        # Hand computation
         a, a_plus_b = 50, 110
         c, c_plus_d = 500, 1220
         expected_prr = (a / a_plus_b) / (c / c_plus_d)
@@ -647,18 +640,14 @@ class TestPRR:
         assert result["drug_cases"] == 50
         assert result["class_cases"] == 500
 
-    def test_prr_ci_lower_bound(self, math_client, monkeypatch):
+    def test_prr_ci_lower_bound(self):
         """CI lower bound uses the Wald formula: exp(ln(PRR) - 1.96 * SE).
 
         SE = sqrt(1/a - 1/(a+b) + 1/c - 1/(c+d))
         """
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
-            return {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 50, "FATIGUE": 30, "HEADACHE": 20, "HEPATOTOXICITY": 10}
+        class_counts = {"NAUSEA": 500, "FATIGUE": 400, "HEADACHE": 300, "HEPATOTOXICITY": 20}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
 
         a, a_plus_b = 50, 110
         c, c_plus_d = 500, 1220
@@ -668,31 +657,22 @@ class TestPRR:
 
         assert result["ci_lower"] == round(expected_ci, 2)
 
-    def test_prr_strong_signal_detected(self, math_client, monkeypatch):
+    def test_prr_strong_signal_detected(self):
         """When CI lower > 1.0 and a >= 3, signal_detected is True."""
-        # Make the drug have a disproportionately high symptom rate
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"HEPATOTOXICITY": 100, "OTHER": 50}  # a=100, a+b=150
-            return {"HEPATOTOXICITY": 50, "OTHER": 5000}      # c=50, c+d=5050
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "HEPATOTOXICITY")
+        drug_counts = {"HEPATOTOXICITY": 100, "OTHER": 50}
+        class_counts = {"HEPATOTOXICITY": 50, "OTHER": 5000}
+        result = calculate_prr(drug_counts, class_counts, "HEPATOTOXICITY")
 
         # PRR = (100/150) / (50/5050) = 0.6667 / 0.0099 ≈ 67.3 → very strong signal
         assert result["signal_detected"] is True
         assert result["prr"] > 1.0
         assert result["ci_lower"] > 1.0
 
-    def test_prr_class_zero_target_symptom(self, math_client, monkeypatch):
+    def test_prr_class_zero_target_symptom(self):
         """When class has zero cases of the target symptom (c=0), guard returns prr=0.0."""
-        def mock_counts(**kwargs):
-            if kwargs.get("drug_name"):
-                return {"NAUSEA": 10, "HEADACHE": 5}
-            return {"HEADACHE": 100}  # no NAUSEA at all → c=0
-        monkeypatch.setattr(math_client, "_fetch_symptom_counts", mock_counts)
-
-        result = math_client._calculate_prr_metrics("TESTDRUG", "TestClass", "NAUSEA")
+        drug_counts = {"NAUSEA": 10, "HEADACHE": 5}
+        class_counts = {"HEADACHE": 100}
+        result = calculate_prr(drug_counts, class_counts, "NAUSEA")
         assert result["prr"] == 0.0
         assert result["signal_detected"] is False
 
