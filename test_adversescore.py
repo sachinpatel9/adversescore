@@ -829,6 +829,108 @@ class TestComputeTrend:
         assert client.compute_trend(data) == "RISING"  # 45 - 35 = 10
 
 
+class TestQuarterlyScoring:
+    """Smoke tests for fetch_quarterly_data scoring values — ensures chart renders correctly."""
+
+    def test_quarterly_scores_within_chart_bounds(self, math_client, monkeypatch):
+        """All quarterly adverse_scores must be in [0, 100] for the Plotly chart Y-axis."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "1", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "1", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "NAUSEA"}]}}
+            for i in range(20)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+        time_series = math_client.fetch_quarterly_data("TEST", num_quarters=4)
+
+        for entry in time_series:
+            score = entry["adverse_score"]
+            assert 0 <= score <= 100, f"Score {score} out of chart range [0, 100]"
+
+    def test_quarterly_scores_not_collapsed_by_decay(self, math_client, monkeypatch):
+        """Weighted mean fix: quarterly scores should reflect severity, not decay to near-zero."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "1", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "1", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "NAUSEA"}]}}
+            for i in range(10)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+        time_series = math_client.fetch_quarterly_data("TEST", num_quarters=4)
+
+        scores_with_data = [e["adverse_score"] for e in time_series if e["report_count"] > 0]
+        for score in scores_with_data:
+            assert score > 5, f"Score {score} suspiciously low — weighted mean may not be working"
+
+    def test_quarterly_elderly_multiplier_propagates(self, math_client, monkeypatch):
+        """Elderly multiplier (1.3x) should apply to each quarter's score."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "0", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "0", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "HEADACHE"}]}}
+            for i in range(10)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+
+        ts_no_age = math_client.fetch_quarterly_data("TEST", num_quarters=4, patient_age=None)
+        ts_elderly = math_client.fetch_quarterly_data("TEST", num_quarters=4, patient_age=85)
+
+        for q_no_age, q_elderly in zip(ts_no_age, ts_elderly):
+            if q_no_age["report_count"] > 0 and q_elderly["report_count"] > 0:
+                base = q_no_age["adverse_score"]
+                elderly = q_elderly["adverse_score"]
+                if base > 0:
+                    expected = min(100, round(base * 1.3))
+                    assert elderly == expected, \
+                        f"Quarter {q_no_age['quarter']}: expected {expected}, got {elderly}"
+
+    def test_quarterly_score_consistent_with_chart_trend_badge(self, math_client, monkeypatch):
+        """Verify trend badge logic matches compute_trend for the same data."""
+        ts = [
+            {"quarter": "2025-Q2", "adverse_score": 20, "prr": None, "report_count": 50},
+            {"quarter": "2025-Q3", "adverse_score": 25, "prr": None, "report_count": 60},
+            {"quarter": "2025-Q4", "adverse_score": 30, "prr": None, "report_count": 70},
+            {"quarter": "2026-Q1", "adverse_score": 45, "prr": None, "report_count": 80},
+        ]
+        # App.py chart badge logic: delta = scores[-1] - scores[-3]
+        scores = [d["adverse_score"] for d in ts]
+        chart_delta = scores[-1] - scores[-3]  # 45 - 25 = 20
+        if chart_delta >= 10:
+            chart_trend = "RISING"
+        elif chart_delta <= -10:
+            chart_trend = "DECLINING"
+        else:
+            chart_trend = "STABLE"
+
+        backend_trend = math_client.compute_trend(ts)
+        assert chart_trend == backend_trend, \
+            f"Chart badge ({chart_trend}) disagrees with compute_trend ({backend_trend})"
+
+
 class TestPersistenceLayer:
     """Tests for SQLite persistence in persistence.py."""
 
