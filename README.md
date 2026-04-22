@@ -48,7 +48,7 @@ Calculates AdverseScore and PRR across **4 rolling quarters** using date-filtere
 - **DECLINING** — Score decreased by 10+ points (signal attenuation)
 - **INSUFFICIENT_DATA** — Fewer than 2 valid quarters
 
-Renders a **Plotly dual-axis line chart** (AdverseScore left axis, PRR right axis) with a trend classification badge.
+Renders a **Plotly dual-axis line chart** (AdverseScore left axis with fixed 0–100 range, PRR right axis) with a trend classification badge.
 
 ### 5. Comparative Safety Scorecard & Session Memory
 **SQLite-backed persistence** automatically saves every completed analysis. Features include:
@@ -74,8 +74,8 @@ adversescore/
 ├── data/                         # SQLite DB (auto-created, gitignored)
 ├── docs/                         # Product Requirements Document
 ├── conftest.py                   # Pytest fixtures (unit + E2E)
-├── test_adversescore.py          # Unit test suite (153 tests)
-├── test_e2e.py                   # E2E integration tests (29 tests, live API)
+├── test_adversescore.py          # Unit test suite (156 tests)
+├── test_e2e.py                   # E2E integration tests (35 tests, live API)
 ├── pytest.ini                    # Pytest configuration & marker registration
 ├── requirements.txt              # Dependencies
 └── .env                          # API keys (gitignored)

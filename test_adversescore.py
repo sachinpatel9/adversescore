@@ -1507,7 +1507,7 @@ class TestBoundaryConditions:
         assert "[115+TO+125]" in query_old
 
     def test_recency_decay_boundary(self, math_client, monkeypatch):
-        """Report 89 days ago gets decay 1.0; 91 days ago gets 0.5 (90-day boundary)."""
+        """Report 89 days ago gets decay 1.0; 91 days ago gets 0.75 (3-tier decay boundary)."""
         day_recent = (datetime.now() - timedelta(days=89)).strftime("%Y%m%d")
         day_old = (datetime.now() - timedelta(days=91)).strftime("%Y%m%d")
         # Use non-serious + labeled to avoid hitting the 100 cap
@@ -1519,10 +1519,10 @@ class TestBoundaryConditions:
         r_old = math_client.calculate_final_score("TEST", reports_old, skip_benchmark=True)
         score_recent = r_recent["clinical_signal"]["adverse_score"]
         score_old = r_old["clinical_signal"]["adverse_score"]
-        # NON_SERIOUS(0.25) * labeled(1.0) * decay * 40
-        # Recent: 0.25 * 1.0 * 40 = 10.0, Old: 0.25 * 0.5 * 40 = 5.0
-        assert score_recent == 10.0
-        assert score_old == 5.0
+        # NON_SERIOUS(0.25) * labeled(1.0) * decay * 80
+        # Recent: 0.25 * 1.0 * 1.0 * 80 = 20.0, Old: 0.25 * 1.0 * 0.75 * 80 = 15.0
+        assert score_recent == 20.0
+        assert score_old == 15.0
 
     def test_score_all_death_unlabeled_recent(self, math_client, monkeypatch):
         """Maximum theoretical input (all death + unlabeled + recent) → score capped at 100."""
@@ -1537,8 +1537,8 @@ class TestBoundaryConditions:
         assert result["clinical_signal"]["adverse_score"] == 100
 
     def test_score_all_non_serious_labeled_old(self, math_client, monkeypatch):
-        """Minimum theoretical input (all non-serious + labeled + old) → score = 5.0."""
-        old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
+        """Minimum theoretical input (all non-serious + labeled + old) → score = 10.0."""
+        old_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
         reports = [
             {"date": old_date, "severity": "Non-Serious", "is_death": False,
              "is_hospitalization": False, "symptoms": "headache"}
@@ -1547,8 +1547,8 @@ class TestBoundaryConditions:
         # Label text contains "headache" so penalty is 1.0
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache, nausea, fatigue")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.5 (old) * 40 = 5.0
-        assert result["clinical_signal"]["adverse_score"] == 5.0
+        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.5 (old, >180d) * 80 = 10.0
+        assert result["clinical_signal"]["adverse_score"] == 10.0
 
     def test_concurrent_severity_tiers(self, math_client, monkeypatch):
         """Mixed severity reports produce a weighted average between the individual tier scores."""
@@ -1562,8 +1562,8 @@ class TestBoundaryConditions:
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
         # Death labeled: 1.75*1.0=1.75, Non-serious labeled: 0.25*1.0=0.25
-        # Mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 40 = 40.0
-        assert result["clinical_signal"]["adverse_score"] == 40.0
+        # Mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 80 = 80.0
+        assert result["clinical_signal"]["adverse_score"] == 80.0
 
     def test_single_report_scoring(self, math_client, monkeypatch):
         """Scoring is deterministic and correct with exactly 1 report as input."""
@@ -1574,5 +1574,5 @@ class TestBoundaryConditions:
         ]
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea, vomiting")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 40 = 40.0
-        assert result["clinical_signal"]["adverse_score"] == 40.0
+        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 80 = 80.0
+        assert result["clinical_signal"]["adverse_score"] == 80.0

@@ -1,4 +1,5 @@
 import math
+import re
 import calendar
 import urllib.parse
 import requests
@@ -251,7 +252,7 @@ class AdverseScoreClient:
         symptom_list = [s.strip().lower() for s in symptoms.split(",") if s.strip()]
         if not symptom_list:
             return 2.0 if is_serious else 1.5
-        is_labeled = any(s in label_text for s in symptom_list)
+        is_labeled = any(re.search(r'\b' + re.escape(s) + r'\b', label_text) for s in symptom_list)
 
         if not is_labeled:
             return 2.0 if is_serious else 1.5
@@ -291,7 +292,7 @@ class AdverseScoreClient:
         symptom_list = [s.strip().lower() for s in symptoms_str.split(",") if s.strip()]
         if not symptom_list:
             return "LABEL_STATUS_UNKNOWN"
-        if any(s in label_text for s in symptom_list):
+        if any(re.search(r'\b' + re.escape(s) + r'\b', label_text) for s in symptom_list):
             return "LABELED"
         return "UNLABELED"
 
@@ -670,14 +671,21 @@ class AdverseScoreClient:
                 prr_metrics = self._calculate_prr_metrics(drug_name, pharm_class, target_symptom, patient_age, patient_sex, label_text=label_text)
 
         total_weighted_points = 0
-        ninety_days_ago = datetime.now() - timedelta(days=90)
+        now = datetime.now()
+        ninety_days_ago = now - timedelta(days=90)
+        one_eighty_days_ago = now - timedelta(days=180)
 
         for report in clean_reports:
             report_score = self._calculate_report_score(report, label_text)
 
             try:
                 report_date = datetime.strptime(report['date'], "%Y%m%d")
-                decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
+                if report_date >= ninety_days_ago:
+                    decay_multiplier = 1.0
+                elif report_date >= one_eighty_days_ago:
+                    decay_multiplier = 0.75
+                else:
+                    decay_multiplier = 0.5
             except (ValueError, TypeError):
                 # METHODOLOGY NOTE: Reports with missing or unparseable dates default to
                 # full recency weight (1.0). This means low-quality reports (which the
@@ -689,13 +697,14 @@ class AdverseScoreClient:
             total_weighted_points += (report_score * decay_multiplier)
         
         mean_signal = total_weighted_points / len(clean_reports)
-        # METHODOLOGY NOTE: The x40 scalar maps the mean weighted signal into a 0-100
+        # METHODOLOGY NOTE: The x80 scalar maps the mean weighted signal into a 0-100
         # range. The theoretical max mean_signal is 1.75 * 2.0 * 1.0 = 3.5 (all death
-        # + unlabeled + recent), yielding 3.5 * 40 = 140, capped to 100. The theoretical
+        # + unlabeled + recent), yielding 3.5 * 80 = 280, capped to 100. The theoretical
         # min for a non-empty dataset is 0.25 * 1.0 * 0.5 = 0.125 (all non-serious +
-        # labeled + old), yielding 0.125 * 40 = 5.0. This scalar is empirically chosen
-        # and not derived from a statistical model.
-        final_score = min(100, round(mean_signal * 40, 2))
+        # labeled + old), yielding 0.125 * 80 = 10.0. A typical mixed-severity drug
+        # produces mean_signal ~0.4-0.6, mapping to 32-48 (Monitor range). This scalar
+        # is empirically chosen and not derived from a statistical model.
+        final_score = min(100, round(mean_signal * 80, 2))
 
         #Add f-string formatting
         status = 'Stable'

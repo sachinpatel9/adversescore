@@ -787,7 +787,8 @@ if prompt:
                     yaxis=dict(
                         title=dict(text='AdverseScore (0-100)', font=dict(family=_chart_font, size=12, color='#6b7280')),
                         tickfont=dict(family=_chart_font, size=11, color='#9ca3af'),
-                        gridcolor='#f3f4f6', gridwidth=1, griddash='dot'
+                        gridcolor='#f3f4f6', gridwidth=1, griddash='dot',
+                        range=[0, 100]
                     ),
                     template='plotly_white',
                     plot_bgcolor='rgba(0,0,0,0)',

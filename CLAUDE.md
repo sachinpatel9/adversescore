@@ -28,8 +28,9 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - **`src/adverse_score/client.py`** — Core engine (~720 lines). Handles all openFDA API calls, scoring math, peer benchmarking, and PRR calculation. Key internals:
   - **Severity weights**: DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
   - **Label penalty**: Unlabeled+Serious=2.0x, Unlabeled+Non-Serious=1.5x, Labeled=1.0x
-  - **Recency decay**: 1.0 if <90 days, 0.5 otherwise
-  - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * 40)`
+  - **Recency decay** (3-tier): 1.0 if <90 days, 0.75 if 90-180 days, 0.5 if >180 days
+  - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * 80)`
+  - **Label matching**: Uses `re.search(r'\b' + re.escape(s) + r'\b', label_text)` word-boundary regex — not substring `in` — to avoid false positives on partial matches
   - **PRR**: Wald 95% CI on log-transformed PRR; signal if CI lower bound > 1.0 and drug cases >= 3
   - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top 3 peers, averages their scores
 - **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast).
