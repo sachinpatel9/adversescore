@@ -1,10 +1,19 @@
 import calendar
+import logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from typing import Optional
-from .config import initialize_config
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from .config import (
+    initialize_config,
+    RETRY_TOTAL, RETRY_BACKOFF_FACTOR, RETRY_STATUS_CODES,
+    TENACITY_MAX_ATTEMPTS, TENACITY_WAIT_MULTIPLIER, TENACITY_WAIT_MIN, TENACITY_WAIT_MAX,
+    API_TIMEOUT_DEFAULT, API_TIMEOUT_AGGREGATION,
+    DEFAULT_DAYS_BACK, DEFAULT_EVENT_LIMIT, DEFAULT_COUNT_LIMIT,
+    AGE_COHORT_RANGE, MAX_PEERS, MIN_PEER_NAME_LENGTH, LABEL_FALLBACK_LIMIT,
+)
 from .logger import get_logger, log_event
 
 logger = get_logger("fda")
@@ -26,20 +35,31 @@ class FDAClient:
         '''
         session = requests.Session()
         retries = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429,500,502,503,504],
+            total=RETRY_TOTAL,
+            backoff_factor=RETRY_BACKOFF_FACTOR,
+            status_forcelist=RETRY_STATUS_CODES,
             allowed_methods=['GET']
         )
         adapter = HTTPAdapter(max_retries=retries)
         session.mount('https://', adapter)
         return session
 
+    @retry(
+        stop=stop_after_attempt(TENACITY_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=TENACITY_WAIT_MULTIPLIER, min=TENACITY_WAIT_MIN, max=TENACITY_WAIT_MAX),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _resilient_get(self, *args, **kwargs):
+        """session.get with tenacity retry for transient failures."""
+        return self.session.get(*args, **kwargs)
+
     def _sanitize_for_query(self, value: str) -> str:
         # Drug names and class names are interpolated into Lucene quoted strings
         return value.replace('\\', '\\\\').replace('"', '\\"')
 
-    def build_query(self, drug_name: str, days_back: int = 365, limit: int = 500,
+    def build_query(self, drug_name: str, days_back: int = DEFAULT_DAYS_BACK, limit: int = DEFAULT_EVENT_LIMIT,
                     patient_age: Optional[int] = None, patient_sex: Optional[str] = None,
                     start_date: Optional[str] = None, end_date: Optional[str] = None) -> str:
         '''
@@ -61,8 +81,8 @@ class FDAClient:
             search_params += f' AND patient.patientsex:{sex_code}'
 
         if patient_age:
-            lower_bound = max(0, patient_age - 5)
-            upper_bound = patient_age + 5
+            lower_bound = max(0, patient_age - AGE_COHORT_RANGE)
+            upper_bound = patient_age + AGE_COHORT_RANGE
             search_params += f' AND patient.patientonsetage:[{lower_bound}+TO+{upper_bound}]'
 
         encoded_search = search_params.replace(" ", "+")
@@ -83,7 +103,7 @@ class FDAClient:
         full_url = f"{self.base_url}?{query_params}&api_key={self.api_key}"
 
         try:
-            response = self.session.get(full_url, timeout=10)
+            response = self._resilient_get(full_url, timeout=API_TIMEOUT_DEFAULT)
             if response.status_code == 404:
                 log_event(logger, "fetch_events_empty", drug=drug_name)
                 return None
@@ -126,7 +146,7 @@ class FDAClient:
         query = f'search=openfda.brand_name:"{safe_name}"&limit=1'
 
         try:
-            response = self.session.get(f"{label_url}?{query}&api_key={self.api_key}", timeout=10)
+            response = self._resilient_get(f"{label_url}?{query}&api_key={self.api_key}", timeout=API_TIMEOUT_DEFAULT)
             response.raise_for_status()
             data = response.json()
 
@@ -150,10 +170,10 @@ class FDAClient:
 
         try:
             log_event(logger, "discover_class_start", drug=target_name)
-            response = self.session.get(
+            response = self._resilient_get(
                 url,
                 params={"search": search_str, "count": count_param, "api_key": self.api_key},
-                timeout=10,
+                timeout=API_TIMEOUT_DEFAULT,
             )
             response.raise_for_status()
             data = response.json()
@@ -179,10 +199,10 @@ class FDAClient:
         search_value = f'openfda.brand_name:"{safe_name}"'
 
         try:
-            response = self.session.get(
+            response = self._resilient_get(
                 url,
-                params={"search": search_value, "limit": 5, "api_key": self.api_key},
-                timeout=10,
+                params={"search": search_value, "limit": LABEL_FALLBACK_LIMIT, "api_key": self.api_key},
+                timeout=API_TIMEOUT_DEFAULT,
             )
             if response.status_code == 404:
                 return ""
@@ -214,7 +234,7 @@ class FDAClient:
         query = f'search=patient.drug.openfda.pharm_class_epc:"{clean_class}"&count=patient.drug.medicinalproduct.exact'
 
         try:
-            response = self.session.get(f"{url}?{query}&api_key={self.api_key}", timeout=10)
+            response = self._resilient_get(f"{url}?{query}&api_key={self.api_key}", timeout=API_TIMEOUT_DEFAULT)
             response.raise_for_status()
             data = response.json()
 
@@ -223,9 +243,9 @@ class FDAClient:
 
             for item in data.get('results', []):
                 peer_name = item.get('term', '').upper()
-                if peer_name and peer_name != target_upper and len(peer_name) > 3:
+                if peer_name and peer_name != target_upper and len(peer_name) > MIN_PEER_NAME_LENGTH:
                     peers.append(peer_name)
-                if len(peers) >= 3:
+                if len(peers) >= MAX_PEERS:
                     break
 
             log_event(logger, "discover_peers_found", peers=peers)
@@ -254,19 +274,19 @@ class FDAClient:
             sex_code = "2" if patient_sex.upper() == "F" else "1"
             query_parts.append(f'patient.patientsex:{sex_code}')
         if patient_age:
-            lower = max(0, patient_age - 5)
-            upper = patient_age + 5
+            lower = max(0, patient_age - AGE_COHORT_RANGE)
+            upper = patient_age + AGE_COHORT_RANGE
             query_parts.append(f'patient.patientonsetage:[{lower}+TO+{upper}]')
         if start_date and end_date:
             query_parts.append(f'receivedate:[{start_date}+TO+{end_date}]')
 
         search_string = "+AND+".join([q.replace(" ", "+") for q in query_parts])
-        url = f"{self.base_url}?search={search_string}&count=patient.reaction.reactionmeddrapt.exact&limit=1000&api_key={self.api_key}"
+        url = f"{self.base_url}?search={search_string}&count=patient.reaction.reactionmeddrapt.exact&limit={DEFAULT_COUNT_LIMIT}&api_key={self.api_key}"
 
         try:
             entity = drug_name or pharm_class
             log_event(logger, "symptom_count_start", entity=entity)
-            response = self.session.get(url, timeout=15)
+            response = self._resilient_get(url, timeout=API_TIMEOUT_AGGREGATION)
             response.raise_for_status()
             data = response.json()
             counts = {}

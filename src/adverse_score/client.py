@@ -1,4 +1,5 @@
 from typing import Optional
+from .config import TREND_RISING_THRESHOLD, TREND_DECLINING_THRESHOLD
 from .fda_client import FDAClient
 from .label_classifier import calculate_label_penalty, classify_label_status
 from .logger import get_logger, log_event
@@ -33,6 +34,7 @@ class AdverseScoreClient:
     def _sanitize_for_query(self, *a, **kw):         return self.fda._sanitize_for_query(*a, **kw)
     def _compute_quarter_boundaries(self, *a, **kw): return self.fda._compute_quarter_boundaries(*a, **kw)
     def _get_transport_session(self):                return self.fda._get_transport_session()
+    def _resilient_get(self, *a, **kw):             return self.fda._resilient_get(*a, **kw)
 
     # ── Pure function delegation (keeps test compat) ────────────────────
     def calculate_label_penalty(self, *a, **kw):     return calculate_label_penalty(*a, **kw)
@@ -179,8 +181,8 @@ class AdverseScoreClient:
         recent = valid[-1]["adverse_score"]
         comparison = valid[-3]["adverse_score"] if len(valid) >= 3 else valid[0]["adverse_score"]
         delta = recent - comparison
-        if delta >= 10:
+        if delta >= TREND_RISING_THRESHOLD:
             return "RISING"
-        elif delta <= -10:
+        elif delta <= TREND_DECLINING_THRESHOLD:
             return "DECLINING"
         return "STABLE"

@@ -26,17 +26,17 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - **`src/adverse_score/orchestrator.py`** — Wires the LangGraph react agent: GPT-4o (temperature=0.2), system prompt with safety protocols (SCOPE ENFORCEMENT, DIAGNOSIS LOCK, TOOL PROTOCOL), single tool binding.
 - **`src/adverse_score/agent_tools.py`** — Defines `ClinicalQuerySchema` (Pydantic v2, `extra="forbid"`) and the `@tool`-decorated `get_adverse_score` function. The schema enforces strict types: `Literal["M","F"]` for sex, `ge=1,le=120` for age, `min_length=1` on drug/symptom strings.
 - **`src/adverse_score/client.py`** — Thin orchestrator (~180 lines). Coordinates data retrieval from `FDAClient` with scoring math from the pure modules. Exposes `AdverseScoreClient` with delegation one-liners for backward compatibility. Orchestration methods: `calculate_final_score`, `_calculate_prr_metrics`, `get_peer_benchmark`, `fetch_quarterly_data`, `compute_trend`.
-- **`src/adverse_score/fda_client.py`** — `FDAClient` class (~300 lines). All openFDA HTTP calls: `fetch_events`, `fetch_label_text`, `_discover_drug_class`, `_discover_peers`, `_fetch_symptom_counts`, `build_query`, `_flatten_results`, `_compute_quarter_boundaries`. Owns the `requests.Session` with retry logic.
+- **`src/adverse_score/fda_client.py`** — `FDAClient` class (~300 lines). All openFDA HTTP calls: `fetch_events`, `fetch_label_text`, `_discover_drug_class`, `_discover_peers`, `_fetch_symptom_counts`, `build_query`, `_flatten_results`, `_compute_quarter_boundaries`. Owns the `requests.Session` with dual-layer retry: urllib3 `Retry` for transport-level status codes (429/5xx) and tenacity `_resilient_get` for application-level transient failures with exponential backoff.
 - **`src/adverse_score/scoring.py`** — Pure scoring math (~200 lines). `SEVERITY_WEIGHTS`, `calculate_report_score`, `calculate_confidence`, `generate_guardrails`, `calculate_final_score`. No HTTP calls — receives all data as parameters.
-  - **Severity weights**: DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
-  - **Label penalty**: Unlabeled+Serious=2.0x, Unlabeled+Non-Serious=1.5x, Labeled=1.0x
-  - **Recency decay**: Exponential with 90-day half-life: `exp(-0.693 * days / 90)`. Returns 1.0 at day 0, 0.5 at 90 days, 0.25 at 180 days.
-  - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * 40)`
-  - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top 3 peers, averages their scores
+  - **Severity weights**: Defined in `config.py` as `SEVERITY_WEIGHT_*`. DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
+  - **Label penalty**: Defined in `config.py` as `LABEL_PENALTY_*`. Unlabeled+Serious=2.0x, Unlabeled+Non-Serious=1.5x, Labeled=1.0x
+  - **Recency decay**: Exponential with `RECENCY_HALF_LIFE_DAYS`=90: `exp(RECENCY_DECAY_CONSTANT * days / 90)`. Returns 1.0 at day 0, 0.5 at 90 days, 0.25 at 180 days.
+  - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * SCORE_SCALAR)`
+  - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top `MAX_PEERS` peers, averages their scores
 - **`src/adverse_score/prr.py`** — Pure PRR + Wald 95% CI math (~70 lines). `calculate_prr(drug_counts, class_counts, target_symptom, label_text)`. Signal if CI lower bound > 1.0 and drug cases >= 3.
 - **`src/adverse_score/label_classifier.py`** — Pure label classification (~30 lines). `calculate_label_penalty` and `classify_label_status`. Zero dependencies beyond stdlib.
 - **`src/adverse_score/logger.py`** — JSON-structured logging to stderr (~20 lines). `get_logger(name)` and `log_event(logger, event, **kwargs)`. All modules use this instead of `print()`.
-- **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast).
+- **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast). Also defines all named constants for the scoring engine: severity weights, label penalties, confidence curve parameters, guardrail thresholds, PRR constants, API timeouts, and retry configuration. Each constant has an inline comment explaining the clinical rationale.
 
 ## Workflow Orchestration 
 
@@ -100,7 +100,7 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 
 - All query-building methods must call `_sanitize_for_query()` before embedding values in Lucene strings. This is a security invariant — check it when adding new FDA queries.
 - openFDA sex codes: **1=Male, 2=Female**. This was previously inverted and is a common source of bugs.
-- The agent's error payload must include `clinical_disclaimer`, `diagnosis_lock`, `requires_human_review`, and `system_directive` — the system prompt rules depend on these fields being present in all payloads. The raw exception message must **never** appear in the payload; log it server-side via `print()` only.
+- The agent's error payload must include `clinical_disclaimer`, `diagnosis_lock`, `requires_human_review`, and `system_directive` — the system prompt rules depend on these fields being present in all payloads. The raw exception message must **never** appear in the payload; log it server-side via `log_event()` only.
 - Peers with zero adverse event data are excluded from benchmark averages to prevent artificial score deflation.
 - A pre-commit hook in `.git/hooks/pre-commit` blocks `.env` files and scans for API key patterns.
 - **`AnalysisStore` (persistence.py)** supports the context manager protocol — prefer `with AnalysisStore() as store:` over manual `.close()` to guarantee connection cleanup on exceptions. `save_analysis` uses `.get()` for optional fields (`label_status`, `class_benchmark_avg`) and is safe to call on Incomplete Data payloads. `get_history` orders by `id DESC` (insertion order) so the most recently saved row is always first regardless of the timestamp value stored.
@@ -109,12 +109,14 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - **`_calculate_prr_metrics`** accepts optional `start_date` and `end_date` parameters and passes them through to `_fetch_symptom_counts`. Use these when computing time-bounded PRR (e.g. per-quarter temporal analysis).
 - **Narrative drug name attribution** in `app.py`: after the agent returns, `st.session_state["last_analyzed_drug"]` is populated from the tool's JSON payload (`clinical_signal.drug_target`). The narrative save block uses this key — do not re-query `get_history(limit=1)` as that is a race condition in concurrent sessions.
 - **`build_query` type hints**: `patient_age`, `patient_sex`, `start_date`, and `end_date` are all typed as `Optional[...]` — do not use bare `int = None` or `str = None` which suppress type checking.
+- **Dual-layer HTTP retry**: `fda_client.py` uses urllib3 `Retry` for transport-level status code retries (429/5xx) and tenacity `_resilient_get()` for application-level transient failure retries with exponential backoff. The tenacity decorator uses `reraise=True` so the original exception propagates to each method's try/except handler after retries exhaust. Tests mock `client.session.get` and the retry logic is exercised transparently.
+- **Config constants**: All tunable numbers (severity weights, label penalties, confidence curve parameters, guardrail thresholds, PRR constants, API timeouts, retry config) are defined in `config.py` with named constants and clinical rationale comments. Modules import them — do not hardcode numeric values in scoring/PRR/FDA modules.
 
 ## Test Suite
 
 The project has two test files:
 
-- **`test_adversescore.py`** — 156 unit tests covering Pydantic validation, query building, scoring math, PRR calculation, confidence metrics, guardrails, persistence, system prompt structure, narrative/temporal/delta protocols, and agent tool behavior. PRR tests call `calculate_prr()` directly with pre-computed count dicts (no mocking). All tests use mocks — no API keys required. Runs in ~3 seconds.
+- **`test_adversescore.py`** — 158 unit tests covering Pydantic validation, query building, scoring math, PRR calculation, confidence metrics, guardrails, persistence, system prompt structure, narrative/temporal/delta protocols, and agent tool behavior. PRR tests call `calculate_prr()` directly with pre-computed count dicts (no mocking). All tests use mocks — no API keys required. Runs in ~3 seconds.
 - **`test_e2e.py`** — 35 end-to-end integration tests hitting the live openFDA API and OpenAI LLM. Covers FDA API contract validation, full pipeline scoring, agent tool invocation, LLM response quality (prose format, disclaimer, scope enforcement), persistence, security regression, and performance benchmarks. Requires API keys in `.env`; tests skip gracefully when keys are absent.
 
 ```bash

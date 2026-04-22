@@ -1,14 +1,26 @@
 import math
 from datetime import datetime, timedelta
 from typing import Optional
+from .config import (
+    SEVERITY_WEIGHT_DEATH, SEVERITY_WEIGHT_HOSPITALIZATION,
+    SEVERITY_WEIGHT_OTHER_SERIOUS, SEVERITY_WEIGHT_NON_SERIOUS,
+    RECENCY_HALF_LIFE_DAYS, RECENCY_DECAY_CONSTANT, SCORE_SCALAR,
+    CONFIDENCE_MAX, CONFIDENCE_BASE, CONFIDENCE_RANGE, CONFIDENCE_REFERENCE_N,
+    CONFIDENCE_DEFECT_PENALTY_WEIGHT,
+    CONFIDENCE_THRESHOLD_HIGH, CONFIDENCE_THRESHOLD_MEDIUM, CONFIDENCE_THRESHOLD_LOW,
+    HUMAN_REVIEW_THRESHOLD, LOW_CONFIDENCE_REVIEW_THRESHOLD,
+    SPECIALIST_ROUTING_THRESHOLD,
+    HIGH_SIGNAL_THRESHOLD, MONITOR_THRESHOLD,
+    ELEVATED_RISK_MULTIPLIER, LOWER_RISK_MULTIPLIER,
+)
 from .label_classifier import calculate_label_penalty
 
 
 SEVERITY_WEIGHTS = {
-    'DEATH': 1.75,
-    'HOSPITALIZATION': 1.0,
-    'OTHER_SERIOUS': 0.75,
-    'NON_SERIOUS': 0.25
+    'DEATH': SEVERITY_WEIGHT_DEATH,
+    'HOSPITALIZATION': SEVERITY_WEIGHT_HOSPITALIZATION,
+    'OTHER_SERIOUS': SEVERITY_WEIGHT_OTHER_SERIOUS,
+    'NON_SERIOUS': SEVERITY_WEIGHT_NON_SERIOUS,
 }
 
 
@@ -35,7 +47,7 @@ def calculate_report_score(report: dict, label_text: str) -> float:
 
 def recency_weight(days_old: int) -> float:
     """Exponential decay with 90-day half-life. Returns 1.0 at day 0, 0.5 at day 90."""
-    return math.exp(-0.693 * days_old / 90)
+    return math.exp(RECENCY_DECAY_CONSTANT * days_old / RECENCY_HALF_LIFE_DAYS)
 
 
 def calculate_confidence(clean_reports: list) -> dict:
@@ -53,15 +65,15 @@ def calculate_confidence(clean_reports: list) -> dict:
     )
     quality_defect_ratio = low_quality_counts / total_reports
 
-    base = min(100.0, 40.0 + (60.0 * math.log1p(total_reports) / math.log1p(80)))
-    penalty = quality_defect_ratio * 50.0
+    base = min(CONFIDENCE_MAX, CONFIDENCE_BASE + (CONFIDENCE_RANGE * math.log1p(total_reports) / math.log1p(CONFIDENCE_REFERENCE_N)))
+    penalty = quality_defect_ratio * CONFIDENCE_DEFECT_PENALTY_WEIGHT
     final_confidence_score = max(0.0, base - penalty)
 
-    if final_confidence_score > 85:
+    if final_confidence_score > CONFIDENCE_THRESHOLD_HIGH:
         level = 'High'
-    elif final_confidence_score >= 65:
+    elif final_confidence_score >= CONFIDENCE_THRESHOLD_MEDIUM:
         level = 'Medium'
-    elif final_confidence_score >= 40:
+    elif final_confidence_score >= CONFIDENCE_THRESHOLD_LOW:
         level = 'Low'
     else:
         level = 'None'
@@ -84,12 +96,12 @@ def generate_guardrails(adverse_score: float, confidence_metrics: dict,
     diagnosis_lock = True
 
     requires_human_review = False
-    if adverse_score > 70:
+    if adverse_score > HUMAN_REVIEW_THRESHOLD:
         requires_human_review = True
-    elif adverse_score > 40 and confidence_level == 'Low':
+    elif adverse_score > LOW_CONFIDENCE_REVIEW_THRESHOLD and confidence_level == 'Low':
         requires_human_review = True
 
-    route_to_specialist = adverse_score > 60
+    route_to_specialist = adverse_score > SPECIALIST_ROUTING_THRESHOLD
 
     if prr_metrics and prr_metrics.get("signal_detected"):
         requires_human_review = True
@@ -163,20 +175,20 @@ def calculate_final_score(drug_name: str, clean_reports: list, label_text: str,
         total_weighted_points += (report_score * decay_multiplier)
 
     mean_signal = total_weighted_points / len(clean_reports)
-    final_score = min(100, round(mean_signal * 40, 2))
+    final_score = min(100, round(mean_signal * SCORE_SCALAR, 2))
 
     status = 'Stable'
-    if final_score > 70:
+    if final_score > HIGH_SIGNAL_THRESHOLD:
         status = 'High Signal - Urgent Review'
-    elif final_score > 30:
+    elif final_score > MONITOR_THRESHOLD:
         status = f'Monitor - Emerging Trend for {drug_name}'
 
     relative_risk = 'N/A'
     if not skip_benchmark and benchmark_avg > 0:
         relative_risk = 'Average'
-        if final_score > (benchmark_avg * 1.5):
+        if final_score > (benchmark_avg * ELEVATED_RISK_MULTIPLIER):
             relative_risk = 'Elevated vs Class Peers'
-        elif final_score < (benchmark_avg * 0.7):
+        elif final_score < (benchmark_avg * LOWER_RISK_MULTIPLIER):
             relative_risk = 'Lower than Class Peers'
 
     confidence_metrics = calculate_confidence(clean_reports)

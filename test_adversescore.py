@@ -224,6 +224,36 @@ class TestFetchEvents:
         result = client.fetch_events("KEYTRUDA")
         assert result is None
 
+    def test_fetch_events_retries_on_connection_error(self, client, monkeypatch):
+        """tenacity retries transient ConnectionError before propagating failure."""
+        import requests
+        call_count = {"n": 0}
+        def flaky_get(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise requests.exceptions.ConnectionError("transient")
+            class OKResponse:
+                status_code = 200
+                def json(self): return {"results": []}
+                def raise_for_status(self): pass
+            return OKResponse()
+        monkeypatch.setattr(client.session, "get", flaky_get)
+        result = client.fetch_events("TESTDRUG")
+        assert result is not None
+        assert call_count["n"] == 3  # 2 failures + 1 success
+
+    def test_fetch_events_exhausts_retries(self, client, monkeypatch):
+        """After 3 failed attempts, tenacity stops and the method returns None."""
+        import requests
+        call_count = {"n": 0}
+        def always_fail(*a, **kw):
+            call_count["n"] += 1
+            raise requests.exceptions.ConnectionError("persistent")
+        monkeypatch.setattr(client.session, "get", always_fail)
+        result = client.fetch_events("TESTDRUG")
+        assert result is None
+        assert call_count["n"] == 3
+
 
 class TestFlattenResults:
     """Tests for _flatten_results() — FDA JSON → flat dicts."""

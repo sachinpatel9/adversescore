@@ -1,4 +1,5 @@
 import math
+from .config import PRR_MINIMUM_DRUG_CASES, PRR_Z_SCORE_95, PRR_SIGNAL_THRESHOLD
 from .label_classifier import classify_label_status
 from .logger import get_logger, log_event
 
@@ -39,7 +40,7 @@ def calculate_prr(drug_counts: dict, class_counts: dict,
     symptom_label_status = classify_label_status(label_text, target_symptom)
 
     # guard against division by zero or stat insignificant sample size
-    if a < 3 or c == 0 or a_plus_b == 0 or c_plus_d == 0:
+    if a < PRR_MINIMUM_DRUG_CASES or c == 0 or a_plus_b == 0 or c_plus_d == 0:
         return {"prr": 0.0, "ci_lower": 0.0, "signal_detected": False,
                 "target_symptom": symptom_upper, "drug_cases": a,
                 "class_cases": c, "label_status": symptom_label_status}
@@ -50,12 +51,12 @@ def calculate_prr(drug_counts: dict, class_counts: dict,
         # 95% CI lower bound for log-transformed PRR (Wald method).
         # SE(ln(PRR)) = sqrt(1/a - 1/(a+b) + 1/c - 1/(c+d))
         se = math.sqrt((1/a) + (1/c) - (1/a_plus_b) - (1/c_plus_d))
-        ci_lower = math.exp(math.log(prr) - 1.96 * se)
+        ci_lower = math.exp(math.log(prr) - PRR_Z_SCORE_95 * se)
     except ValueError:
         ci_lower = 0.0
 
     # Mathematic Guardrail
-    signal_detected = ci_lower > 1.0 and a >= 3
+    signal_detected = ci_lower > PRR_SIGNAL_THRESHOLD and a >= PRR_MINIMUM_DRUG_CASES
 
     if signal_detected:
         log_event(logger, "signal_detected", symptom=symptom_upper, prr=round(prr, 2), ci_lower=round(ci_lower, 2))
