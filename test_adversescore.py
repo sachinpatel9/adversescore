@@ -829,6 +829,108 @@ class TestComputeTrend:
         assert client.compute_trend(data) == "RISING"  # 45 - 35 = 10
 
 
+class TestQuarterlyScoring:
+    """Smoke tests for fetch_quarterly_data scoring values — ensures chart renders correctly."""
+
+    def test_quarterly_scores_within_chart_bounds(self, math_client, monkeypatch):
+        """All quarterly adverse_scores must be in [0, 100] for the Plotly chart Y-axis."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "1", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "1", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "NAUSEA"}]}}
+            for i in range(20)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+        time_series = math_client.fetch_quarterly_data("TEST", num_quarters=4)
+
+        for entry in time_series:
+            score = entry["adverse_score"]
+            assert 0 <= score <= 100, f"Score {score} out of chart range [0, 100]"
+
+    def test_quarterly_scores_not_collapsed_by_decay(self, math_client, monkeypatch):
+        """Weighted mean fix: quarterly scores should reflect severity, not decay to near-zero."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "1", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "1", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "NAUSEA"}]}}
+            for i in range(10)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+        time_series = math_client.fetch_quarterly_data("TEST", num_quarters=4)
+
+        scores_with_data = [e["adverse_score"] for e in time_series if e["report_count"] > 0]
+        for score in scores_with_data:
+            assert score > 5, f"Score {score} suspiciously low — weighted mean may not be working"
+
+    def test_quarterly_elderly_multiplier_propagates(self, math_client, monkeypatch):
+        """Elderly multiplier (1.3x) should apply to each quarter's score."""
+        today = datetime.now().strftime("%Y%m%d")
+        mock_raw = {"results": [
+            {"safetyreportid": f"R{i}", "receivedate": today,
+             "seriousness": "0", "seriousnessdeath": "0",
+             "seriousnesshospitalization": "0", "companynumb": "C1",
+             "patient": {"reaction": [{"reactionmeddrapt": "HEADACHE"}]}}
+            for i in range(10)
+        ]}
+
+        class MockResponse:
+            status_code = 200
+            def json(self): return mock_raw
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr(math_client.session, "get", lambda *a, **kw: MockResponse())
+
+        ts_no_age = math_client.fetch_quarterly_data("TEST", num_quarters=4, patient_age=None)
+        ts_elderly = math_client.fetch_quarterly_data("TEST", num_quarters=4, patient_age=85)
+
+        for q_no_age, q_elderly in zip(ts_no_age, ts_elderly):
+            if q_no_age["report_count"] > 0 and q_elderly["report_count"] > 0:
+                base = q_no_age["adverse_score"]
+                elderly = q_elderly["adverse_score"]
+                if base > 0:
+                    expected = min(100, round(base * 1.3))
+                    assert elderly == expected, \
+                        f"Quarter {q_no_age['quarter']}: expected {expected}, got {elderly}"
+
+    def test_quarterly_score_consistent_with_chart_trend_badge(self, math_client, monkeypatch):
+        """Verify trend badge logic matches compute_trend for the same data."""
+        ts = [
+            {"quarter": "2025-Q2", "adverse_score": 20, "prr": None, "report_count": 50},
+            {"quarter": "2025-Q3", "adverse_score": 25, "prr": None, "report_count": 60},
+            {"quarter": "2025-Q4", "adverse_score": 30, "prr": None, "report_count": 70},
+            {"quarter": "2026-Q1", "adverse_score": 45, "prr": None, "report_count": 80},
+        ]
+        # App.py chart badge logic: delta = scores[-1] - scores[-3]
+        scores = [d["adverse_score"] for d in ts]
+        chart_delta = scores[-1] - scores[-3]  # 45 - 25 = 20
+        if chart_delta >= 10:
+            chart_trend = "RISING"
+        elif chart_delta <= -10:
+            chart_trend = "DECLINING"
+        else:
+            chart_trend = "STABLE"
+
+        backend_trend = math_client.compute_trend(ts)
+        assert chart_trend == backend_trend, \
+            f"Chart badge ({chart_trend}) disagrees with compute_trend ({backend_trend})"
+
+
 class TestPersistenceLayer:
     """Tests for SQLite persistence in persistence.py."""
 
@@ -1548,7 +1650,8 @@ class TestBoundaryConditions:
         assert result["clinical_signal"]["adverse_score"] == 100
 
     def test_score_all_non_serious_labeled_old(self, math_client, monkeypatch):
-        """Minimum theoretical input (all non-serious + labeled + 180 days old) → score = 2.5."""
+        """Minimum theoretical input (all non-serious + labeled + 180 days old) → score = 10.0.
+        With weighted mean, decay cancels out when all reports have the same age."""
         old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
         reports = [
             {"date": old_date, "severity": "Non-Serious", "is_death": False,
@@ -1558,8 +1661,9 @@ class TestBoundaryConditions:
         # Label text contains "headache" so penalty is 1.0
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache, nausea, fatigue")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.25 (180d exponential decay) * 40 = 2.5
-        assert result["clinical_signal"]["adverse_score"] == 2.5
+        # Weighted mean: 0.25 (NON_SERIOUS) * 1.0 (labeled) * 40 = 10.0
+        # (decay cancels in weighted mean when all reports share same age)
+        assert result["clinical_signal"]["adverse_score"] == 10.0
 
     def test_concurrent_severity_tiers(self, math_client, monkeypatch):
         """Mixed severity reports produce a weighted average between the individual tier scores."""
@@ -1573,8 +1677,8 @@ class TestBoundaryConditions:
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
         # Death labeled: 1.75*1.0=1.75, Non-serious labeled: 0.25*1.0=0.25
-        # Mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 80 = 80.0
-        assert result["clinical_signal"]["adverse_score"] == 80.0
+        # Weighted mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 40 = 40.0
+        assert result["clinical_signal"]["adverse_score"] == 40.0
 
     def test_single_report_scoring(self, math_client, monkeypatch):
         """Scoring is deterministic and correct with exactly 1 report as input."""
@@ -1585,5 +1689,130 @@ class TestBoundaryConditions:
         ]
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea, vomiting")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 80 = 80.0
-        assert result["clinical_signal"]["adverse_score"] == 80.0
+        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 40 = 40.0
+        assert result["clinical_signal"]["adverse_score"] == 40.0
+
+
+class TestWeightedMeanFix:
+    """Tests for Bug #1: weighted mean replaces arithmetic mean over raw count."""
+
+    def test_old_reports_dont_collapse_score(self, math_client, monkeypatch):
+        """Mixed-age reports: old reports should NOT drag score to near-zero.
+        With weighted mean, the decay cancels out of the denominator,
+        so only the severity/label component drives the score."""
+        today = datetime.now().strftime("%Y%m%d")
+        old_date = (datetime.now() - timedelta(days=300)).strftime("%Y%m%d")
+        recent_report = {"date": today, "severity": "Serious", "is_death": False,
+                         "is_hospitalization": True, "symptoms": "nausea"}
+        old_report = {"date": old_date, "severity": "Non-Serious", "is_death": False,
+                      "is_hospitalization": False, "symptoms": "headache"}
+        reports = [recent_report] + [old_report] * 9
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea, headache")
+        result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
+        score = result["clinical_signal"]["adverse_score"]
+        # With arithmetic mean over count, this would be ~4. With weighted mean, much higher.
+        assert score > 10, f"Score {score} is suspiciously low — weighted mean may not be working"
+
+    def test_uniform_age_reports_decay_cancels(self, math_client, monkeypatch):
+        """When all reports have the same age, weighted mean equals base_weight * label * SCALAR."""
+        old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
+        reports = [
+            {"date": old_date, "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"}
+            for _ in range(10)
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
+        result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
+        # Weighted mean: decay cancels → 0.25 (NON_SERIOUS) * 1.0 (labeled) * 40 = 10.0
+        assert result["clinical_signal"]["adverse_score"] == 10.0
+
+
+class TestElderlyRiskMultiplier:
+    """Tests for Bug #2: elderly patients (>=65) get 1.3x score amplification."""
+
+    def test_elderly_multiplier_applied(self, math_client, monkeypatch):
+        """Patient age >= 65 → score *= 1.3."""
+        today = datetime.now().strftime("%Y%m%d")
+        reports = [
+            {"date": today, "severity": "Serious", "is_death": False,
+             "is_hospitalization": True, "symptoms": "nausea"}
+            for _ in range(5)
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea")
+        base_result = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=None)
+        elderly_result = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=85)
+        base_score = base_result["clinical_signal"]["adverse_score"]
+        elderly_score = elderly_result["clinical_signal"]["adverse_score"]
+        # Elderly score should be 1.3x base (capped at 100)
+        expected = min(100, round(base_score * 1.3, 2))
+        assert elderly_score == expected
+
+    def test_non_elderly_no_multiplier(self, math_client, monkeypatch):
+        """Patient age < 65 → no multiplier applied."""
+        today = datetime.now().strftime("%Y%m%d")
+        reports = [
+            {"date": today, "severity": "Serious", "is_death": False,
+             "is_hospitalization": True, "symptoms": "nausea"}
+            for _ in range(5)
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea")
+        no_age_result = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=None)
+        young_result = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=30)
+        assert no_age_result["clinical_signal"]["adverse_score"] == \
+               young_result["clinical_signal"]["adverse_score"]
+
+    def test_elderly_threshold_boundary(self, math_client, monkeypatch):
+        """Age 64 → no multiplier, age 65 → multiplier applied."""
+        today = datetime.now().strftime("%Y%m%d")
+        reports = [
+            {"date": today, "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"}
+            for _ in range(5)
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
+        result_64 = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=64)
+        result_65 = math_client.calculate_final_score(
+            "TEST", reports, skip_benchmark=True, patient_age=65)
+        score_64 = result_64["clinical_signal"]["adverse_score"]
+        score_65 = result_65["clinical_signal"]["adverse_score"]
+        assert score_65 > score_64
+        assert score_65 == min(100, round(score_64 * 1.3, 2))
+
+
+class TestMedianDecayFallback:
+    """Tests for Bug #3: undated reports use median decay weight, not 1.0."""
+
+    def test_undated_report_uses_median_not_full_weight(self, math_client, monkeypatch):
+        """An undated report should NOT get decay=1.0; it should get the median of dated reports."""
+        old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
+        reports = [
+            {"date": old_date, "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"},
+            {"date": None, "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"},
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
+        result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
+        # Both reports should get the same decay weight (median of [0.25] = 0.25)
+        # Weighted mean: (0.25*0.25 + 0.25*0.25) / (0.25 + 0.25) = 0.25
+        # Score = 0.25 * 40 = 10.0
+        assert result["clinical_signal"]["adverse_score"] == 10.0
+
+    def test_all_undated_reports_fallback(self, math_client, monkeypatch):
+        """When ALL reports lack dates, median fallback is 0.5."""
+        reports = [
+            {"date": None, "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"},
+            {"date": "invalid", "severity": "Non-Serious", "is_death": False,
+             "is_hospitalization": False, "symptoms": "headache"},
+        ]
+        monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
+        result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
+        # All undated → median fallback = 0.5, weighted mean: 0.25*0.5 / 0.5 = 0.25
+        # Score = 0.25 * 40 = 10.0
+        assert result["clinical_signal"]["adverse_score"] == 10.0

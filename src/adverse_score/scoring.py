@@ -12,6 +12,7 @@ from .config import (
     SPECIALIST_ROUTING_THRESHOLD,
     HIGH_SIGNAL_THRESHOLD, MONITOR_THRESHOLD,
     ELEVATED_RISK_MULTIPLIER, LOWER_RISK_MULTIPLIER,
+    ELDERLY_AGE_THRESHOLD, ELDERLY_RISK_MULTIPLIER,
 )
 from .label_classifier import calculate_label_penalty
 
@@ -159,8 +160,22 @@ def calculate_final_score(drug_name: str, clean_reports: list, label_text: str,
     all_symptoms = ", ".join(r.get("symptoms", "") for r in clean_reports)
     label_status = classify_label_status(label_text, all_symptoms)
 
-    total_weighted_points = 0
     now = datetime.now()
+
+    # First pass: compute decay weights for dated reports to derive median
+    dated_decays = []
+    for report in clean_reports:
+        try:
+            report_date = datetime.strptime(report['date'], "%Y%m%d")
+            days_old = (now - report_date).days
+            dated_decays.append(recency_weight(max(0, days_old)))
+        except (ValueError, TypeError):
+            pass
+    median_decay = sorted(dated_decays)[len(dated_decays) // 2] if dated_decays else 0.5
+
+    # Second pass: score each report with proper decay and weighted mean
+    total_weighted_points = 0
+    total_decay_weight = 0
 
     for report in clean_reports:
         report_score = calculate_report_score(report, label_text)
@@ -170,12 +185,18 @@ def calculate_final_score(drug_name: str, clean_reports: list, label_text: str,
             days_old = (now - report_date).days
             decay_multiplier = recency_weight(max(0, days_old))
         except (ValueError, TypeError):
-            decay_multiplier = 1.0
+            decay_multiplier = median_decay
 
         total_weighted_points += (report_score * decay_multiplier)
+        total_decay_weight += decay_multiplier
 
-    mean_signal = total_weighted_points / len(clean_reports)
-    final_score = min(100, round(mean_signal * SCORE_SCALAR, 2))
+    mean_signal = total_weighted_points / total_decay_weight
+
+    age_multiplier = 1.0
+    if patient_age and patient_age >= ELDERLY_AGE_THRESHOLD:
+        age_multiplier = ELDERLY_RISK_MULTIPLIER
+
+    final_score = min(100, round(mean_signal * SCORE_SCALAR * age_multiplier, 2))
 
     status = 'Stable'
     if final_score > HIGH_SIGNAL_THRESHOLD:
