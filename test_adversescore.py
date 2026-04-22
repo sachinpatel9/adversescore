@@ -1490,23 +1490,20 @@ class TestBoundaryConditions:
         query_old = client.build_query("X", patient_age=120)
         assert "[115+TO+125]" in query_old
 
-    def test_recency_decay_boundary(self, math_client, monkeypatch):
-        """Report 89 days ago gets decay 1.0; 91 days ago gets 0.5 (90-day boundary)."""
-        day_recent = (datetime.now() - timedelta(days=89)).strftime("%Y%m%d")
-        day_old = (datetime.now() - timedelta(days=91)).strftime("%Y%m%d")
-        # Use non-serious + labeled to avoid hitting the 100 cap
+    def test_recency_decay_smooth(self, math_client, monkeypatch):
+        """Exponential decay: 89 and 91 day scores are nearly identical (no cliff)."""
+        day_89 = (datetime.now() - timedelta(days=89)).strftime("%Y%m%d")
+        day_91 = (datetime.now() - timedelta(days=91)).strftime("%Y%m%d")
         report_template = {"severity": "Non-Serious", "is_death": False, "is_hospitalization": False, "symptoms": "headache"}
-        reports_recent = [{**report_template, "date": day_recent}]
-        reports_old = [{**report_template, "date": day_old}]
+        reports_89 = [{**report_template, "date": day_89}]
+        reports_91 = [{**report_template, "date": day_91}]
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
-        r_recent = math_client.calculate_final_score("TEST", reports_recent, skip_benchmark=True)
-        r_old = math_client.calculate_final_score("TEST", reports_old, skip_benchmark=True)
-        score_recent = r_recent["clinical_signal"]["adverse_score"]
-        score_old = r_old["clinical_signal"]["adverse_score"]
-        # NON_SERIOUS(0.25) * labeled(1.0) * decay * 40
-        # Recent: 0.25 * 1.0 * 40 = 10.0, Old: 0.25 * 0.5 * 40 = 5.0
-        assert score_recent == 10.0
-        assert score_old == 5.0
+        score_89 = math_client.calculate_final_score("TEST", reports_89, skip_benchmark=True)["clinical_signal"]["adverse_score"]
+        score_91 = math_client.calculate_final_score("TEST", reports_91, skip_benchmark=True)["clinical_signal"]["adverse_score"]
+        # Exponential decay: 89d ≈ 0.504, 91d ≈ 0.496 — scores differ by < 0.5
+        assert abs(score_89 - score_91) < 0.5
+        assert score_89 > 0
+        assert score_91 > 0
 
     def test_score_all_death_unlabeled_recent(self, math_client, monkeypatch):
         """Maximum theoretical input (all death + unlabeled + recent) → score capped at 100."""
@@ -1521,7 +1518,7 @@ class TestBoundaryConditions:
         assert result["clinical_signal"]["adverse_score"] == 100
 
     def test_score_all_non_serious_labeled_old(self, math_client, monkeypatch):
-        """Minimum theoretical input (all non-serious + labeled + old) → score = 5.0."""
+        """Minimum theoretical input (all non-serious + labeled + 180 days old) → score = 2.5."""
         old_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
         reports = [
             {"date": old_date, "severity": "Non-Serious", "is_death": False,
@@ -1531,8 +1528,8 @@ class TestBoundaryConditions:
         # Label text contains "headache" so penalty is 1.0
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache, nausea, fatigue")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.5 (old) * 40 = 5.0
-        assert result["clinical_signal"]["adverse_score"] == 5.0
+        # 0.25 (NON_SERIOUS) * 1.0 (labeled) * 0.25 (180d exponential decay) * 40 = 2.5
+        assert result["clinical_signal"]["adverse_score"] == 2.5
 
     def test_concurrent_severity_tiers(self, math_client, monkeypatch):
         """Mixed severity reports produce a weighted average between the individual tier scores."""

@@ -1,10 +1,13 @@
 from typing import Optional
 from .fda_client import FDAClient
 from .label_classifier import calculate_label_penalty, classify_label_status
+from .logger import get_logger, log_event
 from .prr import calculate_prr
 from .scoring import (calculate_final_score as _compute_score,
                       calculate_report_score, calculate_confidence,
                       generate_guardrails, SEVERITY_WEIGHTS)
+
+logger = get_logger("client")
 
 
 class AdverseScoreClient:
@@ -101,18 +104,18 @@ class AdverseScoreClient:
         peers = self._discover_peers(pharm_class, target_upper)
 
         if not peers:
-            print(f'[Benchmarking] No peers discovered for {drug_name}. Skipping benchmark.')
+            log_event(logger, "benchmark_no_peers", drug=drug_name)
             return 0.0
 
         peer_scores = []
-        print(f"[Benchmarking] Evaluating {drug_name} against the discovered peers: {', '.join(peers)}")
+        log_event(logger, "benchmark_start", drug=drug_name, peers=peers)
 
         for peer in peers:
-            print(f'[Benchmarking] Fetching clinical data for {peer}...')
+            log_event(logger, "benchmark_peer_fetch", peer=peer)
             raw = self.fetch_events(peer, patient_age, patient_sex)
             clean = self._flatten_results(raw)
             if not clean:
-                print(f'[Benchmarking] No data for peer {peer}, excluding from benchmark.')
+                log_event(logger, "benchmark_peer_empty", peer=peer)
                 continue
             result = self.calculate_final_score(peer, clean, skip_benchmark=True)
             peer_score = result['clinical_signal']['adverse_score']

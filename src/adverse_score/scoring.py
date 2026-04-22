@@ -33,6 +33,11 @@ def calculate_report_score(report: dict, label_text: str) -> float:
     return raw_score
 
 
+def recency_weight(days_old: int) -> float:
+    """Exponential decay with 90-day half-life. Returns 1.0 at day 0, 0.5 at day 90."""
+    return math.exp(-0.693 * days_old / 90)
+
+
 def calculate_confidence(clean_reports: list) -> dict:
     '''
     Evaluates the statistical reliability of the AdverseScore.
@@ -143,14 +148,15 @@ def calculate_final_score(drug_name: str, clean_reports: list, label_text: str,
     label_status = classify_label_status(label_text, all_symptoms)
 
     total_weighted_points = 0
-    ninety_days_ago = datetime.now() - timedelta(days=90)
+    now = datetime.now()
 
     for report in clean_reports:
         report_score = calculate_report_score(report, label_text)
 
         try:
             report_date = datetime.strptime(report['date'], "%Y%m%d")
-            decay_multiplier = 1.0 if report_date >= ninety_days_ago else 0.5
+            days_old = (now - report_date).days
+            decay_multiplier = recency_weight(max(0, days_old))
         except (ValueError, TypeError):
             decay_multiplier = 1.0
 

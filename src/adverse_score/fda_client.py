@@ -5,6 +5,9 @@ from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from typing import Optional
 from .config import initialize_config
+from .logger import get_logger, log_event
+
+logger = get_logger("fda")
 
 
 class FDAClient:
@@ -82,12 +85,12 @@ class FDAClient:
         try:
             response = self.session.get(full_url, timeout=10)
             if response.status_code == 404:
-                print(f"[API] No adverse event reports found for {drug_name} in the queried time range.")
+                log_event(logger, "fetch_events_empty", drug=drug_name)
                 return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            print(f"[API] HTTP error fetching data for {drug_name}: {e}")
+            log_event(logger, "fetch_events_error", drug=drug_name, error=str(e))
             return None
 
     def _flatten_results(self, raw_data) -> list:
@@ -146,7 +149,7 @@ class FDAClient:
         count_param = "patient.drug.openfda.pharm_class_epc.exact"
 
         try:
-            print(f"[Discovery] Attempting algorithmic class mapping for {target_name}...")
+            log_event(logger, "discover_class_start", drug=target_name)
             response = self.session.get(
                 url,
                 params={"search": search_str, "count": count_param, "api_key": self.api_key},
@@ -159,12 +162,12 @@ class FDAClient:
             if results:
                 primary_class = results[0].get('term')
                 count = results[0].get('count')
-                print(f"[Discovery] Class Identified: {primary_class} (N={count})")
+                log_event(logger, "discover_class_found", drug=target_name, pharm_class=primary_class, count=count)
                 return primary_class
 
             return ""
         except Exception as e:
-            print(f"[Discovery] Event based discovery failed: {str(e)}. Falling back to label metadata...")
+            log_event(logger, "discover_class_fallback", drug=target_name, error=str(e))
             return self._fetch_label_class_fallback(target_name)
 
     def _fetch_label_class_fallback(self, drug_name: str) -> str:
@@ -205,7 +208,7 @@ class FDAClient:
         if not pharm_class:
             return []
 
-        print(f"[Discovery] Pharmacologic Class Identified: {pharm_class}")
+        log_event(logger, "discover_peers_start", pharm_class=pharm_class)
         url = "https://api.fda.gov/drug/event.json"
         clean_class = self._sanitize_for_query(pharm_class).replace(' ', '+')
         query = f'search=patient.drug.openfda.pharm_class_epc:"{clean_class}"&count=patient.drug.medicinalproduct.exact'
@@ -225,11 +228,11 @@ class FDAClient:
                 if len(peers) >= 3:
                     break
 
-            print(f"[Discovery] Top Peers Found: {', '.join(peers)}")
+            log_event(logger, "discover_peers_found", peers=peers)
             return peers
 
         except Exception as e:
-            print(f"[Discovery] Failed to find peers for class {pharm_class}.")
+            log_event(logger, "discover_peers_error", pharm_class=pharm_class)
             return []
 
     def _fetch_symptom_counts(self, drug_name: str = None, pharm_class: str = None,
@@ -262,7 +265,7 @@ class FDAClient:
 
         try:
             entity = drug_name or pharm_class
-            print(f"[Aggregation] Running server-side symptom count for {entity}")
+            log_event(logger, "symptom_count_start", entity=entity)
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             data = response.json()

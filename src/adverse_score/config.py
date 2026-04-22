@@ -23,4 +23,6 @@ def initialize_config() -> str:
 # Execution block for testing the config directly
 if __name__ == '__main__':
     key = initialize_config()
-    print("Configuration initialized successfully. All required keys are present.")
+    import logging, json, sys
+    logging.basicConfig(stream=sys.stderr, format='%(message)s')
+    logging.info(json.dumps({"event": "config_initialized"}))

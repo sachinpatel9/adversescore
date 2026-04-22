@@ -1,5 +1,8 @@
 import math
 from .label_classifier import classify_label_status
+from .logger import get_logger, log_event
+
+logger = get_logger("prr")
 
 
 def calculate_prr(drug_counts: dict, class_counts: dict,
@@ -55,7 +58,7 @@ def calculate_prr(drug_counts: dict, class_counts: dict,
     signal_detected = ci_lower > 1.0 and a >= 3
 
     if signal_detected:
-        print(f"[Math Engine] Stat Signal Detected: {symptom_upper} | PRR: {round(prr,2)} | CI Lower: {round(ci_lower, 2)}")
+        log_event(logger, "signal_detected", symptom=symptom_upper, prr=round(prr, 2), ci_lower=round(ci_lower, 2))
 
     return {
         "prr": round(prr, 2),

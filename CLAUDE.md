@@ -30,11 +30,12 @@ The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validatio
 - **`src/adverse_score/scoring.py`** — Pure scoring math (~200 lines). `SEVERITY_WEIGHTS`, `calculate_report_score`, `calculate_confidence`, `generate_guardrails`, `calculate_final_score`. No HTTP calls — receives all data as parameters.
   - **Severity weights**: DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
   - **Label penalty**: Unlabeled+Serious=2.0x, Unlabeled+Non-Serious=1.5x, Labeled=1.0x
-  - **Recency decay**: 1.0 if <90 days, 0.5 otherwise
+  - **Recency decay**: Exponential with 90-day half-life: `exp(-0.693 * days / 90)`. Returns 1.0 at day 0, 0.5 at 90 days, 0.25 at 180 days.
   - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * 40)`
   - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top 3 peers, averages their scores
 - **`src/adverse_score/prr.py`** — Pure PRR + Wald 95% CI math (~70 lines). `calculate_prr(drug_counts, class_counts, target_symptom, label_text)`. Signal if CI lower bound > 1.0 and drug cases >= 3.
 - **`src/adverse_score/label_classifier.py`** — Pure label classification (~30 lines). `calculate_label_penalty` and `classify_label_status`. Zero dependencies beyond stdlib.
+- **`src/adverse_score/logger.py`** — JSON-structured logging to stderr (~20 lines). `get_logger(name)` and `log_event(logger, event, **kwargs)`. All modules use this instead of `print()`.
 - **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast).
 
 ## Workflow Orchestration 
