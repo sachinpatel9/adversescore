@@ -3,6 +3,9 @@ from typing import Optional, Literal
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from langchain_core.tools import tool
 from .client import AdverseScoreClient
+from .logger import get_logger, log_event
+
+logger = get_logger("agent")
 
 #instantiate the client globally so the HTTP session persists across multiple agent calls
 _global_client = AdverseScoreClient()
@@ -51,13 +54,12 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
     Call this tool when a user asks about the safety, side effects, toxicity, or risk profile of a specific medication.
     Extracts demographics and specific target symptoms to execute Proportional Reporting Ration (PRR) analysis if requested.
     '''
-    print(f"\n[Agent Network] Tool Initiated: Fetching AdverseScore for {drug_name.upper()}")
+    log_event(logger, "tool_invoked", drug=drug_name.upper())
 
-    #Visual confirmation 
     if patient_age or patient_sex:
-        print(f"[Agent Network] Demographics Extracted -> Age: {patient_age} | Sex: {patient_sex}")
+        log_event(logger, "demographics_extracted", age=patient_age, sex=patient_sex)
     if target_symptom:
-        print(f"[Agent Network] Target Symptom Extracted -> {target_symptom.upper()}")
+        log_event(logger, "symptom_extracted", symptom=target_symptom.upper())
     
     try:
         raw_data = _global_client.fetch_events(drug_name, patient_age, patient_sex)
@@ -78,7 +80,7 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
         }
 
         if include_temporal:
-            print(f"[Agent Network] Temporal Analysis Requested for {drug_name.upper()}")
+            log_event(logger, "temporal_requested", drug=drug_name.upper())
             time_series = _global_client.fetch_quarterly_data(
                 drug_name, num_quarters=4,
                 patient_age=patient_age, patient_sex=patient_sex,
@@ -110,7 +112,7 @@ def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= 
         return json.dumps(agent_payload)
 
     except Exception as e:
-        print(f"[AdverseScore] Tool error: {e}")
+        log_event(logger, "tool_error", error=str(e))
         error_payload = {
             'metadata': {
                 'tool_name': 'AdverseScore',
