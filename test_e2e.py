@@ -513,6 +513,7 @@ class TestTimeBoundedPRR:
         """_calculate_prr_metrics with start_date/end_date returns valid structure or None."""
         metrics = e2e_client._calculate_prr_metrics(
             drug_name="aspirin",
+            pharm_class="",
             target_symptom="nausea",
             start_date="20240101",
             end_date="20241231",
@@ -529,10 +530,12 @@ class TestTimeBoundedPRR:
         """A one-year window should return fewer or equal drug cases than all-time."""
         all_time = e2e_client._calculate_prr_metrics(
             drug_name="metformin",
+            pharm_class="",
             target_symptom="nausea",
         )
         bounded = e2e_client._calculate_prr_metrics(
             drug_name="metformin",
+            pharm_class="",
             target_symptom="nausea",
             start_date="20240101",
             end_date="20241231",

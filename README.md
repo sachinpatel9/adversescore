@@ -59,7 +59,7 @@ Calculates AdverseScore and PRR across **4 rolling quarters** using date-filtere
 - **DECLINING** — Score decreased by 10+ points (signal attenuation)
 - **INSUFFICIENT_DATA** — Fewer than 2 valid quarters
 
-Renders a **Plotly dual-axis line chart** (AdverseScore left axis, PRR right axis) with a trend classification badge.
+Renders a **Plotly dual-axis line chart** (AdverseScore left axis with fixed 0–100 range, PRR right axis) with a trend classification badge.
 
 ### 5. Comparative Safety Scorecard & Session Memory
 **SQLite-backed persistence** automatically saves every completed analysis. Features include:

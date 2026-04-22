@@ -1573,8 +1573,8 @@ class TestBoundaryConditions:
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "headache")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
         # Death labeled: 1.75*1.0=1.75, Non-serious labeled: 0.25*1.0=0.25
-        # Mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 40 = 40.0
-        assert result["clinical_signal"]["adverse_score"] == 40.0
+        # Mean = (1.75+0.25)/2 = 1.0, score = 1.0 * 80 = 80.0
+        assert result["clinical_signal"]["adverse_score"] == 80.0
 
     def test_single_report_scoring(self, math_client, monkeypatch):
         """Scoring is deterministic and correct with exactly 1 report as input."""
@@ -1585,5 +1585,5 @@ class TestBoundaryConditions:
         ]
         monkeypatch.setattr(math_client, "fetch_label_text", lambda *a: "nausea, vomiting")
         result = math_client.calculate_final_score("TEST", reports, skip_benchmark=True)
-        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 40 = 40.0
-        assert result["clinical_signal"]["adverse_score"] == 40.0
+        # HOSPITALIZATION (1.0) * labeled (1.0) * recent (1.0) * 80 = 80.0
+        assert result["clinical_signal"]["adverse_score"] == 80.0
