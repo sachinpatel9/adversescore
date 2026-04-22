@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta
 from typing import Optional
 from .label_classifier import calculate_label_penalty
@@ -35,18 +36,11 @@ def calculate_report_score(report: dict, label_text: str) -> float:
 def calculate_confidence(clean_reports: list) -> dict:
     '''
     Evaluates the statistical reliability of the AdverseScore.
-    Analyzes sample size (N) and data completeness.
+    Uses a continuous log-linear curve over sample size (N) with a quality penalty.
     '''
     total_reports = len(clean_reports)
     if total_reports == 0:
         return {'level': 'None', 'metric': 0.0, 'defect_ratio': 0.0}
-
-    if total_reports >= 80:
-        base_confidence = 100.0
-    elif total_reports >= 50:
-        base_confidence = 90.0
-    else:
-        base_confidence = 40.0
 
     low_quality_counts = sum(
         1 for r in clean_reports
@@ -54,15 +48,18 @@ def calculate_confidence(clean_reports: list) -> dict:
     )
     quality_defect_ratio = low_quality_counts / total_reports
 
-    final_confidence_score = base_confidence - (quality_defect_ratio * 50)
-    final_confidence_score = max(0.0, final_confidence_score)
+    base = min(100.0, 40.0 + (60.0 * math.log1p(total_reports) / math.log1p(80)))
+    penalty = quality_defect_ratio * 50.0
+    final_confidence_score = max(0.0, base - penalty)
 
-    if final_confidence_score >= 80:
+    if final_confidence_score > 85:
         level = 'High'
-    elif final_confidence_score >= 50:
+    elif final_confidence_score >= 65:
         level = 'Medium'
-    else:
+    elif final_confidence_score >= 40:
         level = 'Low'
+    else:
+        level = 'None'
 
     return {
         'level': level,

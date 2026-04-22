@@ -487,22 +487,22 @@ class TestConfidence:
         assert result["metric"] == 0.0
         assert result["defect_ratio"] == 0.0
 
-    def test_confidence_low_sample(self, math_client):
-        """Fewer than 50 reports → base confidence 40.0 (with no defects)."""
+    def test_confidence_small_sample(self, math_client):
+        """10 clean reports → continuous curve produces 'Medium' confidence."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(10)]
         result = math_client._calculate_confidence(reports)
-        assert result["level"] == "Low"
-        assert result["metric"] == 40.0
+        assert result["level"] == "Medium"
+        assert result["metric"] == 72.7
 
-    def test_confidence_high_from_medium_sample(self, math_client):
-        """50-79 reports → base confidence 90.0 → maps to 'High' confidence level."""
+    def test_confidence_medium_sample(self, math_client):
+        """60 clean reports → continuous curve produces 'High' confidence."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(60)]
         result = math_client._calculate_confidence(reports)
         assert result["level"] == "High"
-        assert result["metric"] == 90.0
+        assert result["metric"] == 96.1
 
     def test_confidence_high_sample(self, math_client):
-        """80+ reports → base confidence 100.0 (with no defects)."""
+        """100+ reports → curve saturates at 100.0."""
         reports = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(100)]
         result = math_client._calculate_confidence(reports)
         assert result["level"] == "High"
@@ -514,17 +514,18 @@ class TestConfidence:
         good = [{"date": "20260101", "symptoms": "NAUSEA"} for _ in range(5)]
         bad = [{"date": None, "symptoms": "NAUSEA"} for _ in range(5)]
         result = math_client._calculate_confidence(good + bad)
-        # base=40 (10 reports < 50), penalty=0.5*50=25, final=40-25=15
-        assert result["metric"] == 15.0
+        # base=72.7 (log-linear for n=10), penalty=0.5*50=25, final=72.7-25=47.7
+        assert result["metric"] == 47.7
         assert result["defect_ratio"] == 0.5
         assert result["level"] == "Low"
 
     def test_confidence_all_defective(self, math_client):
-        """All reports defective → confidence floors at 0.0 (not negative)."""
+        """All reports defective → penalty exceeds base, score floors above 0."""
         reports = [{"date": None, "symptoms": "Unknown"} for _ in range(10)]
         result = math_client._calculate_confidence(reports)
-        # base=40, defect_ratio=1.0, penalty=50, final=max(0, 40-50)=0.0
-        assert result["metric"] == 0.0
+        # base=72.7, defect_ratio=1.0, penalty=50, final=max(0, 72.7-50)=22.7
+        assert result["metric"] == 22.7
+        assert result["level"] == "None"
 
     def test_confidence_unknown_symptoms_counted(self, math_client):
         """Reports with symptoms='Unknown' are counted as defects."""
@@ -532,12 +533,15 @@ class TestConfidence:
         result = math_client._calculate_confidence(reports)
         assert result["defect_ratio"] == 1.0
 
-    def test_confidence_boundary_49_vs_50(self, math_client):
-        """49 reports → base 40.0, 50 reports → base 90.0 (step function boundary)."""
+    def test_confidence_continuous_curve_no_cliff(self, math_client):
+        """49 and 50 reports produce nearly identical scores (no step-function cliff)."""
         reports_49 = [{"date": "20260101", "symptoms": "X"} for _ in range(49)]
         reports_50 = [{"date": "20260101", "symptoms": "X"} for _ in range(50)]
-        assert math_client._calculate_confidence(reports_49)["metric"] == 40.0
-        assert math_client._calculate_confidence(reports_50)["metric"] == 90.0
+        metric_49 = math_client._calculate_confidence(reports_49)["metric"]
+        metric_50 = math_client._calculate_confidence(reports_50)["metric"]
+        assert abs(metric_49 - metric_50) < 1.0
+        assert math_client._calculate_confidence(reports_49)["level"] == "High"
+        assert math_client._calculate_confidence(reports_50)["level"] == "High"
 
 
 class TestFinalScore:
