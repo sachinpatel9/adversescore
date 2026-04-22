@@ -71,6 +71,12 @@ MONITOR_THRESHOLD = 30                 # Score > this → "Monitor - Emerging Tr
 ELEVATED_RISK_MULTIPLIER = 1.5         # score > benchmark * 1.5 → "Elevated vs Class Peers"
 LOWER_RISK_MULTIPLIER = 0.7            # score < benchmark * 0.7 → "Lower than Class Peers"
 
+# ── Elderly Risk Amplification ────────────────────────────────────────────
+# ICH E7 guidelines: elderly patients (≥65) have higher pharmacovigilance risk
+# due to polypharmacy, reduced clearance, and increased frailty.
+ELDERLY_AGE_THRESHOLD = 65             # Age at which elderly multiplier applies
+ELDERLY_RISK_MULTIPLIER = 1.3          # 1.3x score amplification for patients ≥65
+
 # ── PRR (Proportional Reporting Ratio) Constants ─────────────────────────
 PRR_MINIMUM_DRUG_CASES = 3             # Minimum 'a' value for statistically valid PRR
 PRR_Z_SCORE_95 = 1.96                  # Z-score for 95% Wald confidence interval
