@@ -1,11 +1,21 @@
 """
 Unit tests for fda_client.py — query building, HTTP fetch/retry, result
-flattening, label/peer/class discovery, quarter boundaries, and sanitization
-against Lucene injection / special characters.
+flattening, label/peer/class discovery, quarter boundaries, sanitization
+against Lucene injection / special characters, and PSUR chunked/paginated
+retrieval (Phase 2).
 """
 
 import re
 import pytest
+import requests
+from datetime import date
+
+from adverse_score.fda_client import (
+    ChunkResult,
+    compute_psur_period,
+    _compute_psur_chunks,
+    _merge_chunks,
+)
 
 
 # ── Query Building ────────────────────────────────────────────────────────
@@ -322,3 +332,236 @@ class TestSpecialCharacterHandling:
         # The query should still have exactly one opening and closing quote around the drug name
         search_part = query.split("search=")[1].split("&")[0]
         assert 'medicinalproduct:"' in query
+
+
+# ── PSUR Period Anchoring (Phase 2) ────────────────────────────────────────
+
+
+class TestComputePsurPeriod:
+    """Tests for compute_psur_period() — IBD-cycle anchoring to market_authorization_date."""
+
+    def test_worked_example_keytruda_1yr(self):
+        """Approved 2014-09-04, period=1yr, as_of=2026-07-13 -> most recently completed
+        cycle is 2024-09-04 to 2025-09-04 (the 2025-09-04..2026-09-04 cycle hasn't ended yet)."""
+        start, end, used_fallback, reason = compute_psur_period(
+            date(2014, 9, 4), "1yr", as_of=date(2026, 7, 13))
+        assert start == date(2024, 9, 4)
+        assert end == date(2025, 9, 4)
+        assert used_fallback is False
+        assert reason is None
+
+    @pytest.mark.parametrize("period,months", [("6mo", 6), ("1yr", 12), ("2yr", 24), ("3yr", 36)])
+    def test_cycle_length_per_period(self, period, months):
+        start, end, used_fallback, reason = compute_psur_period(
+            date(2014, 9, 4), period, as_of=date(2026, 7, 13))
+        assert used_fallback is False
+        # end is exactly `months` months after start
+        expected_end_year = start.year + (start.month - 1 + months) // 12
+        expected_end_month = (start.month - 1 + months) % 12 + 1
+        assert end.year == expected_end_year
+        assert end.month == expected_end_month
+        assert end.day == start.day
+
+    def test_none_anchor_falls_back(self):
+        start, end, used_fallback, reason = compute_psur_period(
+            None, "1yr", as_of=date(2026, 7, 13))
+        assert used_fallback is True
+        assert reason == "NO_MARKET_AUTH_DATE"
+        assert end == date(2026, 7, 13)
+        assert (end - start).days == 365
+
+    def test_anchor_less_than_one_period_ago_falls_back(self):
+        """Approved 2 months before as_of, period=1yr -> no completed cycle exists yet."""
+        start, end, used_fallback, reason = compute_psur_period(
+            date(2026, 5, 13), "1yr", as_of=date(2026, 7, 13))
+        assert used_fallback is True
+        assert reason == "AUTH_DATE_LESS_THAN_ONE_PERIOD_AGO"
+        assert end == date(2026, 7, 13)
+
+    def test_day_of_month_clamping_does_not_raise(self):
+        """Anchor on the 31st of a month must not raise when a target month has fewer days."""
+        start, end, used_fallback, reason = compute_psur_period(
+            date(2020, 1, 31), "1yr", as_of=date(2026, 7, 13))
+        assert used_fallback is False
+        assert start.day in (28, 29, 30, 31)
+        assert end.day in (28, 29, 30, 31)
+
+
+# ── PSUR Chunk Boundaries (Phase 2) ────────────────────────────────────────
+
+
+class TestComputePsurChunks:
+    """Tests for _compute_psur_chunks() — quarterly sub-period slicing, IBD-anchored."""
+
+    @pytest.mark.parametrize("period,expected_chunks", [
+        ("6mo", 2), ("1yr", 4), ("2yr", 8), ("3yr", 12),
+    ])
+    def test_chunk_count_per_period(self, period, expected_chunks):
+        start, end, _, _ = compute_psur_period(date(2014, 9, 4), period, as_of=date(2026, 7, 13))
+        chunks = _compute_psur_chunks(start, end)
+        assert len(chunks) == expected_chunks
+
+    def test_first_and_last_chunk_match_period_bounds(self):
+        start, end, _, _ = compute_psur_period(date(2014, 9, 4), "1yr", as_of=date(2026, 7, 13))
+        chunks = _compute_psur_chunks(start, end)
+        assert chunks[0][1] == start.strftime("%Y%m%d")
+        assert chunks[-1][2] == end.strftime("%Y%m%d")
+
+    def test_chunks_are_chronologically_contiguous(self):
+        start, end, _, _ = compute_psur_period(date(2014, 9, 4), "1yr", as_of=date(2026, 7, 13))
+        chunks = _compute_psur_chunks(start, end)
+        for i in range(1, len(chunks)):
+            assert chunks[i][1] == chunks[i - 1][2], "Chunks are not contiguous"
+
+    def test_label_format(self):
+        start, end, _, _ = compute_psur_period(date(2014, 9, 4), "1yr", as_of=date(2026, 7, 13))
+        chunks = _compute_psur_chunks(start, end)
+        for label, s, e in chunks:
+            assert re.match(r"chunk-\d+-\d{8}-to-\d{8}", label), f"Invalid label: {label}"
+
+
+# ── PSUR Chunk Pagination (Phase 2) ────────────────────────────────────────
+
+
+class MockPageResponse:
+    def __init__(self, status_code=200, total=0, results=None):
+        self.status_code = status_code
+        self._total = total
+        self._results = results or []
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"meta": {"results": {"total": self._total}}, "results": self._results}
+
+
+def _fake_report(report_id):
+    return {"safetyreportid": report_id, "receivedate": "20250101",
+            "seriousness": "1", "seriousnessdeath": None,
+            "seriousnesshospitalization": None,
+            "patient": {"reaction": [{"reactionmeddrapt": "NAUSEA"}]},
+            "companynumb": "PHARMA-001"}
+
+
+class TestFetchChunkPaginated:
+    """Tests for _fetch_chunk_paginated() — skip/limit pagination, ceiling, and failure handling."""
+
+    def test_exhausted_before_ceiling(self, client, monkeypatch):
+        from adverse_score.config import PSUR_PAGE_SIZE
+        page1 = [_fake_report(f"R{i}") for i in range(PSUR_PAGE_SIZE)]
+        page2 = [_fake_report(f"R{i}") for i in range(PSUR_PAGE_SIZE, PSUR_PAGE_SIZE + 10)]
+        calls = []
+
+        def route(url, **kw):
+            calls.append(kw["params"]["skip"])
+            if kw["params"]["skip"] == 0:
+                return MockPageResponse(200, total=len(page1) + len(page2), results=page1)
+            return MockPageResponse(200, total=len(page1) + len(page2), results=page2)
+        monkeypatch.setattr(client.session, "get", route)
+
+        result = client.fda._fetch_chunk_paginated(["KEYTRUDA"], "chunk-1", "20250101", "20250401")
+        assert len(calls) == 2
+        assert result.truncated is False
+        assert result.error is None
+        assert result.retrieved_count == len(page1) + len(page2)
+
+    def test_ceiling_hit_flags_truncated(self, client, monkeypatch):
+        from adverse_score.config import PSUR_PAGE_SIZE, PSUR_SKIP_CEILING
+        full_page = [_fake_report(f"R{i}") for i in range(PSUR_PAGE_SIZE)]
+
+        def route(url, **kw):
+            # Always return a full page — simulates a dataset larger than the ceiling
+            return MockPageResponse(200, total=999999, results=full_page)
+        monkeypatch.setattr(client.session, "get", route)
+
+        result = client.fda._fetch_chunk_paginated(["KEYTRUDA"], "chunk-1", "20250101", "20250401")
+        assert result.truncated is True
+        assert result.error is None
+        # Loop must terminate (not run forever) once skip exceeds the ceiling
+        max_expected_calls = (PSUR_SKIP_CEILING // PSUR_PAGE_SIZE) + 1
+        assert result.retrieved_count <= max_expected_calls * PSUR_PAGE_SIZE
+
+    def test_mid_pagination_failure_aborts_only_this_chunk(self, client, monkeypatch):
+        from adverse_score.config import PSUR_PAGE_SIZE
+        page1 = [_fake_report(f"R{i}") for i in range(PSUR_PAGE_SIZE)]
+        calls = {"n": 0}
+
+        def route(url, **kw):
+            calls["n"] += 1
+            if kw["params"]["skip"] == 0:
+                return MockPageResponse(200, total=PSUR_PAGE_SIZE * 2, results=page1)
+            raise requests.exceptions.ConnectionError("simulated mid-pagination failure")
+        monkeypatch.setattr(client.session, "get", route)
+
+        result = client.fda._fetch_chunk_paginated(["KEYTRUDA"], "chunk-1", "20250101", "20250401")
+        assert result.truncated is True
+        assert result.error is not None
+        assert result.retrieved_count == len(page1)
+
+    def test_404_first_page_is_empty_not_error(self, client, monkeypatch):
+        monkeypatch.setattr(client.session, "get", lambda *a, **kw: MockPageResponse(404))
+        result = client.fda._fetch_chunk_paginated(["ZZZNOTADRUG"], "chunk-1", "20250101", "20250401")
+        assert result.retrieved_count == 0
+        assert result.truncated is False
+        assert result.error is None
+
+    def test_retries_per_page_via_tenacity(self, client, monkeypatch):
+        """Existing tenacity retry behavior still fires per-page, not once globally."""
+        call_count = {"n": 0}
+
+        def flaky_get(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise requests.exceptions.ConnectionError("transient")
+            return MockPageResponse(200, total=0, results=[])
+        monkeypatch.setattr(client.session, "get", flaky_get)
+
+        result = client.fda._fetch_chunk_paginated(["KEYTRUDA"], "chunk-1", "20250101", "20250401")
+        assert call_count["n"] == 3  # 2 failures + 1 success, per tenacity's retry-per-call
+        assert result.retrieved_count == 0
+        assert result.error is None
+
+
+# ── PSUR Chunk Merge/Dedup (Phase 2) ───────────────────────────────────────
+
+
+def _flat_report(report_id):
+    """A pre-flattened report dict — the shape ChunkResult.reports actually holds
+    (post _flatten_results), distinct from _fake_report's raw FDA JSON shape used
+    to mock HTTP page responses in TestFetchChunkPaginated above."""
+    return {"report_id": report_id, "date": "20250101", "severity": "Serious",
+            "is_death": False, "is_hospitalization": False,
+            "symptoms": "NAUSEA", "company": "PHARMA-001"}
+
+
+class TestMergeChunks:
+    """Tests for _merge_chunks() — boundary-collision list hygiene, not Phase 3's dedup."""
+
+    def test_boundary_duplicate_report_id_kept_once(self):
+        shared = _flat_report("SHARED-ID")
+        chunk1 = ChunkResult(label="chunk-1", start_date="20240101", end_date="20240401",
+                             reports=[shared, _flat_report("UNIQUE-1")],
+                             retrieved_count=2, estimated_total_count=2, truncated=False)
+        chunk2 = ChunkResult(label="chunk-2", start_date="20240401", end_date="20240701",
+                             reports=[shared, _flat_report("UNIQUE-2")],
+                             retrieved_count=2, estimated_total_count=2, truncated=False)
+
+        merged = _merge_chunks([chunk1, chunk2])
+        ids = [r["report_id"] for r in merged]
+        assert len(merged) == 3
+        assert ids.count("SHARED-ID") == 1
+        assert "UNIQUE-1" in ids and "UNIQUE-2" in ids
+
+    def test_empty_chunk_list_returns_empty(self):
+        assert _merge_chunks([]) == []
+
+    def test_chunk_order_preserved(self):
+        chunk1 = ChunkResult(label="chunk-1", start_date="20240101", end_date="20240401",
+                             reports=[_flat_report("A")],
+                             retrieved_count=1, estimated_total_count=1, truncated=False)
+        chunk2 = ChunkResult(label="chunk-2", start_date="20240401", end_date="20240701",
+                             reports=[_flat_report("B")],
+                             retrieved_count=1, estimated_total_count=1, truncated=False)
+        merged = _merge_chunks([chunk1, chunk2])
+        assert [r["report_id"] for r in merged] == ["A", "B"]

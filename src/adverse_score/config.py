@@ -55,6 +55,19 @@ DRUG_IDENTITY_DRUGSFDA_LIMIT = 10      # max drugsfda.json application records p
 # excluded — a withdrawn-then-reapproved product's history is not modeled.
 DRUGSFDA_APPROVED_STATUS = "AP"
 
+# ── PSUR Chunked Retrieval Constants (Phase 2) ────────────────────────────
+PSUR_PAGE_SIZE = 1000          # openFDA's hard per-request cap on `limit`. Distinct from
+                                # DEFAULT_EVENT_LIMIT=500 (single-page sampling) — PSUR retrieval
+                                # must exhaust each chunk, so always request the API's real max.
+PSUR_SKIP_CEILING = 25000      # openFDA enforces skip+limit <= 26000. Capping skip at 25000
+                                # leaves room for one final PSUR_PAGE_SIZE=1000 page (25000+1000=
+                                # 26000, exactly at the boundary) before flagging truncation.
+PSUR_CHUNK_MONTHS = 3          # Sub-period chunk width (quarterly), counted forward from the
+                                # PSUR period's anchor date — not calendar-quarter-aligned.
+PSUR_PERIOD_MONTHS = {"6mo": 6, "1yr": 12, "2yr": 24, "3yr": 36}
+PSUR_PERIOD_FALLBACK_DAYS = {"6mo": 182, "1yr": 365, "2yr": 730, "3yr": 1095}  # rolling-lookback
+                                # day counts used only on the fallback (no-anchor) path.
+
 # ── Retry Configuration ────────────────────────────────────────────────────
 RETRY_TOTAL = 3                        # urllib3 transport-level retry count
 RETRY_BACKOFF_FACTOR = 1               # urllib3 exponential backoff multiplier
