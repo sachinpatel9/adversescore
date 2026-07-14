@@ -65,7 +65,7 @@ tool access every subagent below requires.
   summary of what was built (function/class names, file paths) for the Review SubAgent.
 
 3. Review SubAgent:
-* Model: attempt `model: opus` (Opus 4.8)
+* Model: attempt `model: sonnet` (Sonnet 5)
 * Tool access: full tool access (Read, Write, Edit, Bash, etc.) — needed to make direct
   fixes to the code if bugs are identified.
 * Scope: Reviews only the diff produced by the Build SubAgent, against the originating
