@@ -48,7 +48,12 @@ scope.
 — those two agent types do not have Write/Edit tools and would silently break the full
 tool access every subagent below requires.
 
-1. Build SubAgent:
+1. Orchestrator Agent 
+* Model: Fable 5 (OR Opus 4.8 when Fable 5 is no longer available due to usage limits)
+* Tool Access: Full tool access (Read, Write, Edit, Bash, etc)
+* Purpose: Plans and delegates to the SubAgent workers
+
+2. Build SubAgent:
 * Model: Sonnet 5 (high effort)
 * Tool access: full tool access (Read, Write, Edit, Bash, etc.) — needed to write code and
   run tests directly.
@@ -59,9 +64,8 @@ tool access every subagent below requires.
 * Produces: working code + a passing test suite for the declared scope, plus a concise
   summary of what was built (function/class names, file paths) for the Review SubAgent.
 
-2. Review SubAgent:
-* Model: attempt `model: fable` (Fable 5, medium effort) first; if that dispatch errors or
-  Fable is otherwise unavailable, retry the identical review with `model: opus` (Opus 4.8).
+3. Review SubAgent:
+* Model: attempt `model: opus` (Opus 4.8)
 * Tool access: full tool access (Read, Write, Edit, Bash, etc.) — needed to make direct
   fixes to the code if bugs are identified.
 * Scope: Reviews only the diff produced by the Build SubAgent, against the originating
@@ -77,7 +81,7 @@ tool access every subagent below requires.
 * Out of scope: documentation files. Runs only after the Build SubAgent reports completion.
 * Produces: a short report of what was found/fixed, handed to the Write SubAgent.
 
-3. Write SubAgent:
+4. Write SubAgent:
 * Model: Haiku (Medium Effort)
 * Tool access: full tool access (Read, Write, Edit, Bash, etc.), though its scope below
   only requires Read/Edit on CLAUDE.md and README.md.
