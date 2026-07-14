@@ -160,6 +160,21 @@ PUBLIC_HEALTH_TIER_ORDER = (
     PUBLIC_HEALTH_TIER_LOW,
 )
 
+# ── Phase 8 — Agent Orchestration & Guardrails ────────────────────────────
+OPENAI_CHAT_MODEL = "gpt-4o"           # per scope doc Section 3.3, no engine change
+AGENT_TEMPERATURE = 0.1                # low — favors consistency over creativity in a PV context
+AGENT_MAX_ITERATIONS = 5               # caps the tool-calling loop; prevents runaway agent behavior
+TOP_N_NARRATED_SIGNALS = 20            # scope doc's own example cap for conversational narration
+CONVERSATION_ROLE_USER = "user"
+CONVERSATION_ROLE_ASSISTANT = "assistant"
+CONVERSATION_ROLE_SYSTEM = "system"
+
+# ── Phase 9 — Document Generation (PBRER/PSUR .docx export) ──────────────
+DOCUMENT_NARRATION_TEMPERATURE = 0.0   # lower than AGENT_TEMPERATURE — prioritizes faithfulness over natural variation for a document artifact
+PBRER_PLACEHOLDER_TEXT = "[Section not populated by AdverseScore — to be completed by Regulatory Affairs]"
+PBRER_DRAFT_MARKING_TEXT = "DRAFT — NOT FOR REGULATORY SUBMISSION — Pending Qualified PV/Clinical Review"
+PBRER_OMITTED_SECTIONS_NOTE = "Sections 2-5, 7-14, 16.4-19, and 20 (Appendices) of the ICH E2C(R2) PBRER format are not populated by AdverseScore in this draft."
+
 # ── Retry Configuration ────────────────────────────────────────────────────
 RETRY_TOTAL = 3                        # urllib3 transport-level retry count
 RETRY_BACKOFF_FACTOR = 1               # urllib3 exponential backoff multiplier
