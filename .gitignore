@@ -2,5 +2,17 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+
+#data store
 data/
-PRODUCT_OVERVIEW.md
+
+#documentation
+docs/
+
+
+CLAUDE.md
+.claude/
+
+
+

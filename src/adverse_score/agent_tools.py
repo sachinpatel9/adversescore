@@ -1,130 +1,240 @@
-import json
-from typing import Optional, Literal
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+"""Agent tool boundary — Phase 8 of the PSUR consolidation rebuild.
+
+The old single `get_adverse_score` tool tied to the five-capability composite
+score was removed as part of the PSUR consolidation rebuild (Phase 0, see
+docs/PSUR_CONSOLIDATION_SCOPE.md). This module wraps the two Phase 1/6 entry
+points (`drug_identity.resolve_drug_identity`, `consolidation.consolidate_psur`)
+as LangChain `@tool`-decorated callables for `orchestrator.py`'s LangGraph
+agent.
+
+Both tools return plain, JSON-serializable dicts — the shape an LLM tool-call
+result gets serialized into and fed back into the message history. Frozen
+dataclasses and `date` objects are never returned directly (LangGraph would
+choke serializing them into a ToolMessage); this module is exactly where that
+translation happens, matching the boundary `drug_identity.py`'s own docstring
+calls out ("this module does NOT use the agent-facing payload shape ... that
+translation belongs to Phase 8's agent_tools.py").
+
+No HTTP calls are made directly in this module — both tools delegate to
+already-HTTP-capable Phase 1/6 modules.
+"""
+import contextvars
+import dataclasses
+from typing import Optional
+
 from langchain_core.tools import tool
-from .client import AdverseScoreClient
+
+from .config import TOP_N_NARRATED_SIGNALS
+from .consolidation import consolidate_psur, ConsolidationError, ConsolidationResult
+from .drug_identity import resolve_drug_identity, DrugIdentityError
 from .logger import get_logger, log_event
 
-logger = get_logger("agent")
+logger = get_logger("agent_tools")
 
-#instantiate the client globally so the HTTP session persists across multiple agent calls
-_global_client = AdverseScoreClient()
 
-#Strict Extraction Schema (Pydantic)
-class ClinicalQuerySchema(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    drug_name: str = Field(
-        ...,
-        min_length=1,
-        description="The exact brand or generic name of the target drug (ex. KEYTRUDA, OZEMPIC)."
-    )
-    patient_age: Optional[int] = Field(
-        None,
-        ge=1,
-        le=120,
-        description='The exact age of the patient in years (1-120), if provided in the prompt.'
-    )
-    patient_sex: Optional[Literal["M", "F"]] = Field(
-        None,
-        description="The biological sex of the patient, strictly 'M' or 'F', if provided in the prompt."
-    )
-    target_symptom: Optional[str] = Field(
-        None,
-        min_length=1,
-        description="The specific adverse event, side effect, or symptom to analyze (eg. 'pancreatitis', 'fatigue') if provided."
-    )
-    include_temporal: Optional[bool] = Field(
-        None,
-        description="Set to true when the user asks about trends, changes over time, quarterly data, or historical safety patterns."
-    )
+# ── Out-of-band full-result capture ────────────────────────────────────────
+# `consolidate_psur_tool`'s LLM-visible return value is deliberately a bounded
+# summary dict (see its docstring below) — a full `ConsolidationResult`, with
+# its thousands of nested per-report dicts, would blow the LLM's context
+# window if it flowed back through the tool-message channel. But
+# `orchestrator.py`'s `run_agent_turn()` needs the FULL `ConsolidationResult`
+# object (dates, nested dataclasses and all) to populate
+# `AgentTurnResult.updated_dataset`, and LangGraph only threads a tool's
+# *return value* back into the message history — there is no built-in side
+# channel for "also hand the caller this other, bigger object."
+#
+# Design chosen: a `contextvars.ContextVar` holding a mutable list ("capture
+# box"), NOT a bare module-level variable and NOT `threading.local()`.
+# `threading.local()` was tried first and does not work here: LangGraph's
+# prebuilt `ToolNode` dispatches synchronous tool calls onto an internal
+# worker thread (confirmed empirically during Phase 8 build — a tool prints
+# `threading.current_thread()` and it is NOT the thread that called
+# `graph.invoke()`), so thread-local storage written inside the tool is
+# invisible to `orchestrator.py`'s calling thread.
+#
+# `contextvars.ContextVar` values DO cross this same thread hop (Python's
+# executor bridge copies the calling context into the worker thread), but
+# only for *mutation of an already-referenced object* — rebinding the
+# ContextVar itself from within a copied context (a `.set()` call made
+# inside the tool) does NOT propagate back to the caller's context. This
+# holds even when there is no literal thread hop: LangChain's `Runnable.
+# invoke()` already runs the callable inside a `contextvars.copy_context()`
+# for callback/config isolation, so a tool can never reach back out and
+# rebind a ContextVar in its caller's context, whether or not a real OS
+# thread boundary is also involved (verified experimentally during Phase 8
+# build, both with and without going through a LangGraph tool node).
+#
+# So the pattern here is REQUIRED, not optional: the caller
+# (`orchestrator.run_agent_turn`, via `begin_consolidation_capture()`)
+# pre-creates an empty list and `.set()`s the ContextVar to reference it
+# BEFORE calling `graph.invoke()` (or, for direct/standalone tool
+# invocation, before calling `.invoke()`). The tool, running in a copied
+# context (possibly on a different thread), calls `.get()` to reach that
+# SAME list object and mutates it in place (`.append()`) — a mutation, not a
+# rebind, so it stays visible in the list object the caller is still holding
+# a reference to. If `begin_consolidation_capture()` was never called, the
+# capture box is `None` and `_stash_consolidation_result` is a documented
+# no-op — there is nothing it could write into that would be visible to any
+# caller.
+_capture_var: "contextvars.ContextVar" = contextvars.ContextVar(
+    "adversescore_consolidation_capture", default=None
+)
 
-    @field_validator("drug_name")
-    @classmethod
-    def normalize_drug_name(cls, v: str) -> str:
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("drug_name must not be blank after stripping whitespace")
-        return stripped
 
-#Agent Tool 
-@tool(args_schema=ClinicalQuerySchema)
-def get_adverse_score(drug_name: str, patient_age: int= None, patient_sex: str= None, target_symptom: str = None, include_temporal: bool = None) -> str: #type: ignore case
-    '''
-    Calculates a clinial safety risk score (0-100) based on FDA adverse event reports,
-    Call this tool when a user asks about the safety, side effects, toxicity, or risk profile of a specific medication.
-    Extracts demographics and specific target symptoms to execute Proportional Reporting Ration (PRR) analysis if requested.
-    '''
-    log_event(logger, "tool_invoked", drug=drug_name.upper())
+def begin_consolidation_capture() -> None:
+    """Installs a fresh, empty capture box in the CURRENT context. Callers
+    MUST call this once per turn/invocation, before invoking the agent graph
+    (or calling `consolidate_psur_tool` directly), so the tool's `.append()`
+    (see module docstring above) has something to write into that's still
+    reachable by the caller afterwards. Without this call first,
+    `consolidate_psur_tool` still runs and returns its summary dict
+    normally — only the out-of-band full-result capture is skipped."""
+    _capture_var.set([])
 
-    if patient_age or patient_sex:
-        log_event(logger, "demographics_extracted", age=patient_age, sex=patient_sex)
-    if target_symptom:
-        log_event(logger, "symptom_extracted", symptom=target_symptom.upper())
-    
+
+def _stash_consolidation_result(result: ConsolidationResult) -> None:
+    box = _capture_var.get()
+    if box is None:
+        # No capture box was pre-installed via begin_consolidation_capture().
+        # There is nothing reachable to write into (see module docstring —
+        # a `.set()` here would only rebind this copied context's view of
+        # the ContextVar, invisible to the caller) — documented no-op.
+        return
+    box.append(result)
+
+
+def pop_last_consolidation_result() -> Optional[ConsolidationResult]:
+    """Reads and clears the most recently captured full `ConsolidationResult`
+    (stashed by `consolidate_psur_tool` on its most recent successful call in
+    this context's capture box). Returns `None` if the tool was not called,
+    was called and failed, or no capture box exists yet."""
+    box = _capture_var.get()
+    if not box:
+        return None
+    result = box[-1]
+    box.clear()
+    return result
+
+
+# ── Tools ────────────────────────────────────────────────────────────────
+# Both tools are the LLM's only bridge into Phase 1-6 pipeline code. LangGraph's
+# `create_agent` (the installed langchain==1.2.11's API — see orchestrator.py's
+# module docstring) does not expose a way to wire a custom `ToolNode(...,
+# handle_tool_errors=True)` through it, so by default ANY exception escaping a
+# tool function crashes the entire graph run (verified empirically during
+# Phase 8 build: an LLM passing a malformed argument, e.g. period="last 6
+# months" instead of the required literal "6mo", raised a raw KeyError deep in
+# fda_client.py that propagated uncaught all the way out of graph.invoke()).
+# Both tools below are therefore defensive at two layers: (1) validate
+# arguments the pipeline modules assume are already well-formed before calling
+# them, and (2) wrap the pipeline call in a broad `except Exception` so no
+# malformed LLM tool-call argument or unexpected pipeline bug can ever crash a
+# whole agent turn — worst case, the LLM (or the end user) sees a structured
+# error dict instead.
+
+_VALID_PERIODS = ("6mo", "1yr", "2yr", "3yr")
+
+
+@tool
+def resolve_drug_identity_tool(drug_name: str) -> dict:
+    """Look up a drug's canonical identity (brand/generic names, market
+    authorization date) without running a full PSUR consolidation. Use for
+    quick identity questions ('is X the same as Y?') that don't need the
+    full signal dataset."""
     try:
-        raw_data = _global_client.fetch_events(drug_name, patient_age, patient_sex)
-        clean_list = _global_client._flatten_results(raw_data) if raw_data else []
-        agent_payload = _global_client.calculate_final_score(
-            drug_name, 
-            clean_list,
-            patient_age=patient_age,
-            patient_sex=patient_sex,
-            target_symptom=target_symptom # type: ignore
-        )
+        result = resolve_drug_identity(drug_name)
+    except Exception as e:  # pipeline bug or malformed input — never crash the turn
+        log_event(logger, "agent_tool_resolve_identity_unexpected_exception",
+                  drug_name=drug_name, error=str(e))
+        return {"error": "UNEXPECTED_EXCEPTION", "message": str(e)}
 
-        #Inject the parsed demographics back into the metadata so the UI can see them 
-        agent_payload['metadata']['extracted_demographics'] = {
-            'age': patient_age,
-            'sex': patient_sex,
-            'target_symptom': target_symptom
+    if isinstance(result, DrugIdentityError):
+        log_event(logger, "agent_tool_resolve_identity_error",
+                  drug_name=drug_name, reason=result.reason)
+        return {"error": result.reason, "message": result.message}
+
+    payload = dataclasses.asdict(result)
+    mad = payload.get("market_authorization_date")
+    # dates aren't JSON/LLM-serializable as-is — same .isoformat()-if-not-None
+    # pattern persistence.py already established for this exact field.
+    payload["market_authorization_date"] = mad.isoformat() if mad else None
+
+    log_event(logger, "agent_tool_resolve_identity_success",
+              drug_name=drug_name, canonical_name=payload.get("canonical_name"))
+    return payload
+
+
+@tool
+def consolidate_psur_tool(drug_name: str, period: str) -> dict:
+    """Run the full PSUR consolidation pipeline for a drug + period. Returns
+    ranked signals, completeness metadata, dedup stats, and label status
+    breakdown. This is the primary data-gathering tool — expensive (can take
+    minutes for high-volume drugs), so only call it when the user is asking
+    about a NEW drug/period not already in the current session's dataset.
+
+    `period` MUST be exactly one of the four literal strings "6mo", "1yr",
+    "2yr", or "3yr" — no other phrasing (e.g. "last 6 months", "one year")
+    is accepted. Translate the user's natural-language period into one of
+    these four values before calling this tool."""
+    if period not in _VALID_PERIODS:
+        log_event(logger, "agent_tool_consolidate_invalid_period",
+                  drug_name=drug_name, period=period)
+        return {
+            "error": "INVALID_PERIOD",
+            "message": (
+                f"period must be exactly one of {_VALID_PERIODS!r}, got "
+                f"{period!r}. Translate the user's requested timeframe into "
+                "one of these four literal values and try again."
+            ),
         }
 
-        if include_temporal:
-            log_event(logger, "temporal_requested", drug=drug_name.upper())
-            time_series = _global_client.fetch_quarterly_data(
-                drug_name, num_quarters=4,
-                patient_age=patient_age, patient_sex=patient_sex,
-                target_symptom=target_symptom
-            )
-            trend_classification = _global_client.compute_trend(time_series)
-            agent_payload['temporal_analysis'] = {
-                'time_series': time_series,
-                'trend_classification': trend_classification,
-            }
+    try:
+        result = consolidate_psur(drug_name, period)
+    except Exception as e:  # pipeline bug or malformed input — never crash the turn
+        log_event(logger, "agent_tool_consolidate_unexpected_exception",
+                  drug_name=drug_name, period=period, error=str(e))
+        return {"error": "UNEXPECTED_EXCEPTION", "message": str(e)}
 
-        # --- Persistence: save analysis and detect delta vs prior ---
-        try:
-            from .persistence import AnalysisStore
-            store = AnalysisStore()
-            prior = store.get_prior_analysis(drug_name)
-            store.save_analysis(agent_payload)
-            if prior:
-                score_delta = agent_payload["clinical_signal"]["adverse_score"] - prior["adverse_score"]
-                agent_payload["delta_detection"] = {
-                    "prior_score": prior["adverse_score"],
-                    "prior_date": prior["timestamp"],
-                    "score_delta": round(score_delta, 2),
-                }
-            store.close()
-        except Exception:
-            pass  # Skip persistence for incomplete/error payloads — never mask a successful score
+    if isinstance(result, ConsolidationError):
+        log_event(logger, "agent_tool_consolidate_error", drug_name=drug_name,
+                  period=period, stage=result.stage, reason=result.reason)
+        return {"error": result.stage, "reason": result.reason, "message": result.message}
 
-        return json.dumps(agent_payload)
+    # Full result captured out-of-band for orchestrator.py — see module
+    # docstring above. The dict returned below is what the LLM sees; it is
+    # NOT sufficient on its own to reconstruct `result` (no report-level
+    # data, no drug_identity/retrieval/dedup nested dataclasses).
+    _stash_consolidation_result(result)
 
-    except Exception as e:
-        log_event(logger, "tool_error", error=str(e))
-        error_payload = {
-            'metadata': {
-                'tool_name': 'AdverseScore',
-                'status': 'System Error',
-                'clinical_disclaimer': 'This tool is for informational purposes only and does not constitute medical advice.'
-            },
-            'agent_directives': {
-                'diagnosis_lock': True,
-                'requires_human_review': False,
-                'route_to_specialist': False,
-                'system_directive': 'Inform the user that the AdverseScore tool encountered a system error and could not complete the analysis. Please try again or contact support.'
-            }
+    top_signals = [
+        {
+            "symptom": signal.symptom,
+            "rank": signal.rank,
+            "seriousness_tier": signal.seriousness_tier,
+            "strength_of_evidence_tier": signal.strength_of_evidence_tier,
+            "reversibility_tier": signal.reversibility_tier,
+            "public_health_tier": signal.public_health_tier,
+            "report_count": signal.report_count,
+            "prr_metrics": signal.prr_metrics,
         }
-        return json.dumps(error_payload)
-    
+        for signal in result.ranking.ranked_signals[:TOP_N_NARRATED_SIGNALS]
+    ]
+
+    summary = {
+        "canonical_name": result.drug_identity.canonical_name,
+        "period": result.period,
+        "total_retrieved_count": result.retrieval.total_retrieved_count,
+        "total_estimated_count": result.retrieval.total_estimated_count,
+        "any_chunk_truncated": result.retrieval.any_chunk_truncated,
+        "dedup_total_input_count": result.dedup.total_input_count,
+        "dedup_total_output_count": result.dedup.total_output_count,
+        "dedup_removed_by_exact_id": result.dedup.removed_by_exact_id,
+        "dedup_removed_by_heuristic": result.dedup.removed_by_heuristic,
+        "formula_version": result.formula_version,
+        "total_signals": result.ranking.total_signals,
+        "top_signals": top_signals,
+    }
+
+    log_event(logger, "agent_tool_consolidate_success", drug_name=drug_name,
+              period=period, total_signals=result.ranking.total_signals)
+    return summary

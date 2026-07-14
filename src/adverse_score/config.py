@@ -7,86 +7,26 @@ def initialize_config() -> str:
     Returns the openFDA API key for the AdverseScoreClient.
     """
     load_dotenv()
-    
+
     fda_key = os.getenv('OPENFDA_API_KEY')
     openai_key = os.getenv('OPENAI_API_KEY')
 
     # Fail Fast Validations
     if not fda_key:
         raise EnvironmentError("OPENFDA_API_KEY is not set in environment variables. Please set it in your .env file.")
-    
+
     if not openai_key:
         raise EnvironmentError("OPENAI_API_KEY is not set. The LangChain Agent requires this to execute.")
 
     return fda_key
 
 
-# ── Clinical Scoring Constants ─────────────���──────────────────────────────
-# Severity tier weights for individual adverse event reports.
-# Based on regulatory seriousness criteria (ICH E2D guidelines).
-SEVERITY_WEIGHT_DEATH = 1.75           # Fatal outcome — highest signal weight
-SEVERITY_WEIGHT_HOSPITALIZATION = 1.0  # Required or prolonged hospitalization
-SEVERITY_WEIGHT_OTHER_SERIOUS = 0.75   # Serious but not hospitalized (disability, congenital anomaly, etc.)
-SEVERITY_WEIGHT_NON_SERIOUS = 0.25     # Non-serious adverse event
-
-# Label penalty multipliers — unlabeled events receive higher weight because
-# they represent potentially novel safety signals not yet in the drug label.
-LABEL_PENALTY_UNLABELED_SERIOUS = 2.0      # Serious + not in label → 2x weight
-LABEL_PENALTY_UNLABELED_NON_SERIOUS = 1.5  # Non-serious + not in label → 1.5x weight
-LABEL_PENALTY_LABELED = 1.0                # Already in label → no penalty
-
-# Recency decay — exponential half-life model (replaces binary 90-day cliff).
-# Reports lose half their weight every 90 days: weight = exp(-0.693 * days / 90).
-RECENCY_HALF_LIFE_DAYS = 90
-RECENCY_DECAY_CONSTANT = -0.693  # ln(0.5), mathematically derived from half-life
-
-# Score normalization — final_score = min(100, mean_weighted_signal * SCORE_SCALAR).
-# 40 was calibrated so that a drug with all-hospitalization labeled reports scores ~40/100.
-SCORE_SCALAR = 40
-
-# ── Confidence Curve Constants ────────────────────────────────���───────────
-# Continuous log-linear curve: min(MAX, BASE + RANGE * log1p(N) / log1p(REF_N))
-CONFIDENCE_MAX = 100.0
-CONFIDENCE_BASE = 40.0                 # Minimum confidence for N=1
-CONFIDENCE_RANGE = 60.0                # Maximum additional confidence from sample size
-CONFIDENCE_REFERENCE_N = 80            # Sample size where curve approaches saturation
-CONFIDENCE_DEFECT_PENALTY_WEIGHT = 50.0  # Weight applied to defect ratio penalty
-
-# Confidence level thresholds
-CONFIDENCE_THRESHOLD_HIGH = 85
-CONFIDENCE_THRESHOLD_MEDIUM = 65
-CONFIDENCE_THRESHOLD_LOW = 40
-
-# ── Guardrail Thresholds ─────────────────────────────────────────────────
-# Deterministic flags that control AI behavior downstream.
-HUMAN_REVIEW_THRESHOLD = 70            # Score > this → requires_human_review = True
-LOW_CONFIDENCE_REVIEW_THRESHOLD = 40   # Score > this AND confidence == 'Low' → human review
-SPECIALIST_ROUTING_THRESHOLD = 60      # Score > this → route_to_specialist = True
-
-# ── Status Classification Thresholds ─────────────────────────────────────
-HIGH_SIGNAL_THRESHOLD = 70             # Score > this → "High Signal - Urgent Review"
-MONITOR_THRESHOLD = 30                 # Score > this → "Monitor - Emerging Trend"
-
-# ── Benchmark Comparison Multipliers ────��────────────────────────────────
-ELEVATED_RISK_MULTIPLIER = 1.5         # score > benchmark * 1.5 → "Elevated vs Class Peers"
-LOWER_RISK_MULTIPLIER = 0.7            # score < benchmark * 0.7 → "Lower than Class Peers"
-
-# ── Elderly Risk Amplification ────────────────────────────────────────────
-# ICH E7 guidelines: elderly patients (≥65) have higher pharmacovigilance risk
-# due to polypharmacy, reduced clearance, and increased frailty.
-ELDERLY_AGE_THRESHOLD = 65             # Age at which elderly multiplier applies
-ELDERLY_RISK_MULTIPLIER = 1.3          # 1.3x score amplification for patients ≥65
-
 # ── PRR (Proportional Reporting Ratio) Constants ─────────────────────────
 PRR_MINIMUM_DRUG_CASES = 3             # Minimum 'a' value for statistically valid PRR
 PRR_Z_SCORE_95 = 1.96                  # Z-score for 95% Wald confidence interval
 PRR_SIGNAL_THRESHOLD = 1.0             # CI lower bound must exceed this for signal detection
 
-# ── Trend Classification Thresholds ────────���─────────────────────────────
-TREND_RISING_THRESHOLD = 10            # Score delta >= this → RISING
-TREND_DECLINING_THRESHOLD = -10        # Score delta <= this → DECLINING
-
-# ── openFDA API Configuration ────────��───────────────────────────────────
+# ── openFDA API Configuration ─────────────────────────────────────────────
 API_TIMEOUT_DEFAULT = 10               # Seconds — standard endpoint timeout
 API_TIMEOUT_AGGREGATION = 15           # Seconds — count endpoint (server-side aggregation)
 DEFAULT_DAYS_BACK = 365                # Default lookback window for event queries
@@ -97,7 +37,145 @@ MAX_PEERS = 3                          # Maximum peer drugs for benchmark compar
 MIN_PEER_NAME_LENGTH = 3              # Exclude abbreviations (<=3 chars) from peer list
 LABEL_FALLBACK_LIMIT = 5              # Max label results for class fallback lookup
 
-# ── Retry Configuration ───────────��─────────────────────────────────────��
+# ── Drug Identity Resolution Constants (Phase 1) ─────────────────────────
+# Endpoint paths for drug identity/approval-date resolution — kept as named
+# constants so a future openFDA API version bump is a one-line change.
+DRUGSFDA_ENDPOINT = "https://api.fda.gov/drug/drugsfda.json"
+NDC_ENDPOINT = "https://api.fda.gov/drug/ndc.json"
+
+# Result caps for identity-resolution queries. Small limits are intentional:
+# we need enough records to union brand/generic/substance name variants and
+# find an application_number, not an exhaustive product catalog.
+DRUG_IDENTITY_LABEL_LIMIT = 5          # max label.json records to inspect per lookup
+DRUG_IDENTITY_NDC_LIMIT = 5            # max ndc.json records to inspect per fallback lookup
+DRUG_IDENTITY_DRUGSFDA_LIMIT = 10      # max drugsfda.json application records per date lookup
+
+# submission_status value considered "approved" for market authorization date
+# purposes. Other values (e.g. "TA" tentative approval, "WD" withdrawn) are
+# excluded — a withdrawn-then-reapproved product's history is not modeled.
+DRUGSFDA_APPROVED_STATUS = "AP"
+
+# ── PSUR Chunked Retrieval Constants (Phase 2) ────────────────────────────
+PSUR_PAGE_SIZE = 1000          # openFDA's hard per-request cap on `limit`. Distinct from
+                                # DEFAULT_EVENT_LIMIT=500 (single-page sampling) — PSUR retrieval
+                                # must exhaust each chunk, so always request the API's real max.
+PSUR_SKIP_CEILING = 25000      # openFDA enforces skip+limit <= 26000. Capping skip at 25000
+                                # leaves room for one final PSUR_PAGE_SIZE=1000 page (25000+1000=
+                                # 26000, exactly at the boundary) before flagging truncation.
+PSUR_CHUNK_MONTHS = 3          # Sub-period chunk width (quarterly), counted forward from the
+                                # PSUR period's anchor date — not calendar-quarter-aligned.
+PSUR_PERIOD_MONTHS = {"6mo": 6, "1yr": 12, "2yr": 24, "3yr": 36}
+PSUR_PERIOD_FALLBACK_DAYS = {"6mo": 182, "1yr": 365, "2yr": 730, "3yr": 1095}  # rolling-lookback
+                                # day counts used only on the fallback (no-anchor) path.
+
+# ── Phase 5 — Deterministic Ranking Engine ────────────────────────────────
+# Signal ranking is a lexicographic tiered sort across four criteria (Seriousness &
+# Outcome, Strength of Evidence, Reversibility, Public Health Impact) — never a
+# weighted sum or single composite scalar (explicitly banned by
+# docs/PSUR_CONSOLIDATION_SCOPE.md Section 3.1). Each criterion below defines an
+# ordered tuple of tier-name strings; ranking.py maps a signal's tier string to its
+# position in the relevant tuple (index 0 = highest priority) purely as an internal
+# sort key — that integer is never persisted on a RankedSignal or exposed as a score.
+
+RANKING_FORMULA_VERSION = "1.0"  # Guardrail 6 audit-trail tag; must appear verbatim
+                                  # in ranking.py's RankingResult.formula_version.
+
+# Seriousness & Outcome tiers — ordinal clinical severity ordering, carried forward
+# from the old (Phase-0-removed) scoring.py's SEVERITY_WEIGHTS relative ordering
+# (DEATH > HOSPITALIZATION > OTHER_SERIOUS > NON_SERIOUS), but as pure ordinal tiers
+# only — no numeric weights are reintroduced.
+SERIOUSNESS_TIER_DEATH = "DEATH"
+SERIOUSNESS_TIER_HOSPITALIZATION = "HOSPITALIZATION"
+SERIOUSNESS_TIER_OTHER_SERIOUS = "OTHER_SERIOUS"
+SERIOUSNESS_TIER_NON_SERIOUS = "NON_SERIOUS"
+SERIOUSNESS_TIER_ORDER = (
+    SERIOUSNESS_TIER_DEATH,
+    SERIOUSNESS_TIER_HOSPITALIZATION,
+    SERIOUSNESS_TIER_OTHER_SERIOUS,
+    SERIOUSNESS_TIER_NON_SERIOUS,
+)
+
+# Strength-of-Evidence tiers — PRR signal_detected (calculate_prr's own boolean)
+# crossed with label status (calculate_prr's own label_status field). "Strong" =
+# signal_detected True; "Weak" = signal_detected False. Within each signal_detected
+# bucket, UNLABELED outranks LABELED (an unlabeled signal carries more evidentiary
+# weight per the scope doc), and LABEL_STATUS_UNKNOWN is its own lowest-priority
+# bucket overall (least actionable — label status genuinely unknown).
+STRENGTH_TIER_STRONG_UNLABELED = "STRONG_UNLABELED"
+STRENGTH_TIER_STRONG_LABELED = "STRONG_LABELED"
+STRENGTH_TIER_WEAK_UNLABELED = "WEAK_UNLABELED"
+STRENGTH_TIER_WEAK_LABELED = "WEAK_LABELED"
+STRENGTH_TIER_UNKNOWN_LABEL_STATUS = "UNKNOWN_LABEL_STATUS"
+STRENGTH_TIER_ORDER = (
+    STRENGTH_TIER_STRONG_UNLABELED,
+    STRENGTH_TIER_STRONG_LABELED,
+    STRENGTH_TIER_WEAK_UNLABELED,
+    STRENGTH_TIER_WEAK_LABELED,
+    STRENGTH_TIER_UNKNOWN_LABEL_STATUS,
+)
+
+# Reversibility tiers — derived from FAERS patient.reaction.reactionoutcome codes.
+# Per openFDA's documented code set:
+#   1 = Recovered/resolved
+#   2 = Recovering/resolving
+#   3 = Not recovered/not resolved
+#   4 = Recovered/resolved with sequelae
+#   5 = Fatal
+#   6 = Unknown
+# REVERSIBILITY is a documented heuristic (scope doc Section 7: FAERS structured
+# fields cannot always directly establish true clinical reversibility) — codes are
+# bucketed into four clinical tiers rather than used as six raw values.
+REACTION_OUTCOME_RECOVERED = 1
+REACTION_OUTCOME_RECOVERING = 2
+REACTION_OUTCOME_NOT_RECOVERED = 3
+REACTION_OUTCOME_RECOVERED_WITH_SEQUELAE = 4
+REACTION_OUTCOME_FATAL = 5
+REACTION_OUTCOME_UNKNOWN_CODE = 6
+
+REVERSIBILITY_TIER_FATAL = "FATAL"
+REVERSIBILITY_TIER_POOR = "POOR"
+REVERSIBILITY_TIER_REVERSIBLE = "REVERSIBLE"
+REVERSIBILITY_TIER_UNKNOWN = "UNKNOWN"
+REVERSIBILITY_TIER_ORDER = (
+    REVERSIBILITY_TIER_FATAL,
+    REVERSIBILITY_TIER_POOR,
+    REVERSIBILITY_TIER_REVERSIBLE,
+    REVERSIBILITY_TIER_UNKNOWN,
+)
+
+# Public Health Impact tiers — report volume is used as a directional proxy for
+# population exposure, per scope doc Section 7's documented simplification (FAERS
+# report counts are not true epidemiological exposure data). Thresholds are round
+# numbers chosen for a prototype-appropriate three-bucket split, not derived from
+# an epidemiological model.
+PUBLIC_HEALTH_HIGH_VOLUME_THRESHOLD = 100      # >= this many drug_cases -> HIGH
+PUBLIC_HEALTH_MODERATE_VOLUME_THRESHOLD = 20   # >= this many (but < HIGH) -> MODERATE
+                                                # below MODERATE threshold -> LOW
+PUBLIC_HEALTH_TIER_HIGH = "HIGH"
+PUBLIC_HEALTH_TIER_MODERATE = "MODERATE"
+PUBLIC_HEALTH_TIER_LOW = "LOW"
+PUBLIC_HEALTH_TIER_ORDER = (
+    PUBLIC_HEALTH_TIER_HIGH,
+    PUBLIC_HEALTH_TIER_MODERATE,
+    PUBLIC_HEALTH_TIER_LOW,
+)
+
+# ── Phase 8 — Agent Orchestration & Guardrails ────────────────────────────
+OPENAI_CHAT_MODEL = "gpt-4o"           # per scope doc Section 3.3, no engine change
+AGENT_TEMPERATURE = 0.1                # low — favors consistency over creativity in a PV context
+AGENT_MAX_ITERATIONS = 5               # caps the tool-calling loop; prevents runaway agent behavior
+TOP_N_NARRATED_SIGNALS = 20            # scope doc's own example cap for conversational narration
+CONVERSATION_ROLE_USER = "user"
+CONVERSATION_ROLE_ASSISTANT = "assistant"
+CONVERSATION_ROLE_SYSTEM = "system"
+
+# ── Phase 9 — Document Generation (PBRER/PSUR .docx export) ──────────────
+DOCUMENT_NARRATION_TEMPERATURE = 0.0   # lower than AGENT_TEMPERATURE — prioritizes faithfulness over natural variation for a document artifact
+PBRER_PLACEHOLDER_TEXT = "[Section not populated by AdverseScore — to be completed by Regulatory Affairs]"
+PBRER_DRAFT_MARKING_TEXT = "DRAFT — NOT FOR REGULATORY SUBMISSION — Pending Qualified PV/Clinical Review"
+PBRER_OMITTED_SECTIONS_NOTE = "Sections 2-5, 7-14, 16.4-19, and 20 (Appendices) of the ICH E2C(R2) PBRER format are not populated by AdverseScore in this draft."
+
+# ── Retry Configuration ────────────────────────────────────────────────────
 RETRY_TOTAL = 3                        # urllib3 transport-level retry count
 RETRY_BACKOFF_FACTOR = 1               # urllib3 exponential backoff multiplier
 RETRY_STATUS_CODES = [429, 500, 502, 503, 504]  # HTTP codes that trigger transport retry
