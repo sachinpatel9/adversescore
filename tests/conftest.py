@@ -87,8 +87,8 @@ def mock_fda_response():
                 "seriousnesshospitalization": None,
                 "patient": {
                     "reaction": [
-                        {"reactionmeddrapt": "CARDIAC ARREST"},
-                        {"reactionmeddrapt": "DEATH"},
+                        {"reactionmeddrapt": "CARDIAC ARREST", "reactionoutcome": "5"},
+                        {"reactionmeddrapt": "DEATH", "reactionoutcome": "5"},
                     ]
                 },
                 "companynumb": "PHARMA-001",

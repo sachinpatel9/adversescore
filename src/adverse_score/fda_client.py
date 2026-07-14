@@ -160,6 +160,22 @@ def _parse_version(raw) -> int:
         return 1
 
 
+def _parse_outcome_code(raw) -> Optional[int]:
+    """Parses a raw FAERS reactionoutcome value to an int in the valid 1-6 range
+    (per openFDA's documented code set: 1=Recovered, 2=Recovering, 3=Not recovered,
+    4=Recovered with sequelae, 5=Fatal, 6=Unknown). Unlike _parse_version, there is
+    no safe default to fall back to here — reversibility ranking (Phase 5) must
+    never assume a code when one isn't genuinely present, so missing/non-numeric/
+    out-of-range values all return None rather than guessing. Never raises."""
+    try:
+        code = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if code < 1 or code > 6:
+        return None
+    return code
+
+
 def _merge_chunks(chunk_results: list) -> list:
     """First-seen-wins merge on report_id across chunks, in chronological chunk order.
 
@@ -305,6 +321,11 @@ class FDAClient:
                 'symptom_list': reactions,
                 'drug_names': _extract_drug_names(report),
                 'safetyreportversion': _parse_version(report.get('safetyreportversion')),
+                'reactions': [
+                    {'term': r.get('reactionmeddrapt', 'Unknown'),
+                     'outcome_code': _parse_outcome_code(r.get('reactionoutcome'))}
+                    for r in raw_reactions
+                ],
             }
             flattened.append(entry)
         return flattened

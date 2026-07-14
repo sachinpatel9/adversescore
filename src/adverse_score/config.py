@@ -68,6 +68,98 @@ PSUR_PERIOD_MONTHS = {"6mo": 6, "1yr": 12, "2yr": 24, "3yr": 36}
 PSUR_PERIOD_FALLBACK_DAYS = {"6mo": 182, "1yr": 365, "2yr": 730, "3yr": 1095}  # rolling-lookback
                                 # day counts used only on the fallback (no-anchor) path.
 
+# ── Phase 5 — Deterministic Ranking Engine ────────────────────────────────
+# Signal ranking is a lexicographic tiered sort across four criteria (Seriousness &
+# Outcome, Strength of Evidence, Reversibility, Public Health Impact) — never a
+# weighted sum or single composite scalar (explicitly banned by
+# docs/PSUR_CONSOLIDATION_SCOPE.md Section 3.1). Each criterion below defines an
+# ordered tuple of tier-name strings; ranking.py maps a signal's tier string to its
+# position in the relevant tuple (index 0 = highest priority) purely as an internal
+# sort key — that integer is never persisted on a RankedSignal or exposed as a score.
+
+RANKING_FORMULA_VERSION = "1.0"  # Guardrail 6 audit-trail tag; must appear verbatim
+                                  # in ranking.py's RankingResult.formula_version.
+
+# Seriousness & Outcome tiers — ordinal clinical severity ordering, carried forward
+# from the old (Phase-0-removed) scoring.py's SEVERITY_WEIGHTS relative ordering
+# (DEATH > HOSPITALIZATION > OTHER_SERIOUS > NON_SERIOUS), but as pure ordinal tiers
+# only — no numeric weights are reintroduced.
+SERIOUSNESS_TIER_DEATH = "DEATH"
+SERIOUSNESS_TIER_HOSPITALIZATION = "HOSPITALIZATION"
+SERIOUSNESS_TIER_OTHER_SERIOUS = "OTHER_SERIOUS"
+SERIOUSNESS_TIER_NON_SERIOUS = "NON_SERIOUS"
+SERIOUSNESS_TIER_ORDER = (
+    SERIOUSNESS_TIER_DEATH,
+    SERIOUSNESS_TIER_HOSPITALIZATION,
+    SERIOUSNESS_TIER_OTHER_SERIOUS,
+    SERIOUSNESS_TIER_NON_SERIOUS,
+)
+
+# Strength-of-Evidence tiers — PRR signal_detected (calculate_prr's own boolean)
+# crossed with label status (calculate_prr's own label_status field). "Strong" =
+# signal_detected True; "Weak" = signal_detected False. Within each signal_detected
+# bucket, UNLABELED outranks LABELED (an unlabeled signal carries more evidentiary
+# weight per the scope doc), and LABEL_STATUS_UNKNOWN is its own lowest-priority
+# bucket overall (least actionable — label status genuinely unknown).
+STRENGTH_TIER_STRONG_UNLABELED = "STRONG_UNLABELED"
+STRENGTH_TIER_STRONG_LABELED = "STRONG_LABELED"
+STRENGTH_TIER_WEAK_UNLABELED = "WEAK_UNLABELED"
+STRENGTH_TIER_WEAK_LABELED = "WEAK_LABELED"
+STRENGTH_TIER_UNKNOWN_LABEL_STATUS = "UNKNOWN_LABEL_STATUS"
+STRENGTH_TIER_ORDER = (
+    STRENGTH_TIER_STRONG_UNLABELED,
+    STRENGTH_TIER_STRONG_LABELED,
+    STRENGTH_TIER_WEAK_UNLABELED,
+    STRENGTH_TIER_WEAK_LABELED,
+    STRENGTH_TIER_UNKNOWN_LABEL_STATUS,
+)
+
+# Reversibility tiers — derived from FAERS patient.reaction.reactionoutcome codes.
+# Per openFDA's documented code set:
+#   1 = Recovered/resolved
+#   2 = Recovering/resolving
+#   3 = Not recovered/not resolved
+#   4 = Recovered/resolved with sequelae
+#   5 = Fatal
+#   6 = Unknown
+# REVERSIBILITY is a documented heuristic (scope doc Section 7: FAERS structured
+# fields cannot always directly establish true clinical reversibility) — codes are
+# bucketed into four clinical tiers rather than used as six raw values.
+REACTION_OUTCOME_RECOVERED = 1
+REACTION_OUTCOME_RECOVERING = 2
+REACTION_OUTCOME_NOT_RECOVERED = 3
+REACTION_OUTCOME_RECOVERED_WITH_SEQUELAE = 4
+REACTION_OUTCOME_FATAL = 5
+REACTION_OUTCOME_UNKNOWN_CODE = 6
+
+REVERSIBILITY_TIER_FATAL = "FATAL"
+REVERSIBILITY_TIER_POOR = "POOR"
+REVERSIBILITY_TIER_REVERSIBLE = "REVERSIBLE"
+REVERSIBILITY_TIER_UNKNOWN = "UNKNOWN"
+REVERSIBILITY_TIER_ORDER = (
+    REVERSIBILITY_TIER_FATAL,
+    REVERSIBILITY_TIER_POOR,
+    REVERSIBILITY_TIER_REVERSIBLE,
+    REVERSIBILITY_TIER_UNKNOWN,
+)
+
+# Public Health Impact tiers — report volume is used as a directional proxy for
+# population exposure, per scope doc Section 7's documented simplification (FAERS
+# report counts are not true epidemiological exposure data). Thresholds are round
+# numbers chosen for a prototype-appropriate three-bucket split, not derived from
+# an epidemiological model.
+PUBLIC_HEALTH_HIGH_VOLUME_THRESHOLD = 100      # >= this many drug_cases -> HIGH
+PUBLIC_HEALTH_MODERATE_VOLUME_THRESHOLD = 20   # >= this many (but < HIGH) -> MODERATE
+                                                # below MODERATE threshold -> LOW
+PUBLIC_HEALTH_TIER_HIGH = "HIGH"
+PUBLIC_HEALTH_TIER_MODERATE = "MODERATE"
+PUBLIC_HEALTH_TIER_LOW = "LOW"
+PUBLIC_HEALTH_TIER_ORDER = (
+    PUBLIC_HEALTH_TIER_HIGH,
+    PUBLIC_HEALTH_TIER_MODERATE,
+    PUBLIC_HEALTH_TIER_LOW,
+)
+
 # ── Retry Configuration ────────────────────────────────────────────────────
 RETRY_TOTAL = 3                        # urllib3 transport-level retry count
 RETRY_BACKOFF_FACTOR = 1               # urllib3 exponential backoff multiplier

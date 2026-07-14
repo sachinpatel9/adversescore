@@ -246,6 +246,81 @@ class TestFlattenResults:
         assert flat[0]["safetyreportversion"] == 1
         assert flat[1]["safetyreportversion"] == 1
 
+    def test_flatten_results_reactions_key_present_with_valid_outcome(self, client, mock_fda_response):
+        """The 'reactions' key holds term/outcome_code pairs; a valid reactionoutcome
+        ('5' in the shared fixture's first report) parses to int 5 (FATAL code)."""
+        flat = client._flatten_results(mock_fda_response)
+        first_reactions = flat[0]["reactions"]
+        assert first_reactions == [
+            {"term": "CARDIAC ARREST", "outcome_code": 5},
+            {"term": "DEATH", "outcome_code": 5},
+        ]
+
+    def test_flatten_results_reactions_missing_outcome_is_none(self, client):
+        """A raw reaction entry with no reactionoutcome key yields outcome_code: None."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-200",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "patient": {
+                "reaction": [{"reactionmeddrapt": "NAUSEA"}],
+                "drug": [],
+            },
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["reactions"] == [{"term": "NAUSEA", "outcome_code": None}]
+
+    @pytest.mark.parametrize("bad_value", [None, "", "7", "0", "abc", "5.5"])
+    def test_flatten_results_reactions_malformed_outcome_is_none(self, client, bad_value):
+        """None/empty/out-of-range(1-6)/non-numeric reactionoutcome values all yield
+        outcome_code: None without raising."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-201",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "patient": {
+                "reaction": [{"reactionmeddrapt": "NAUSEA", "reactionoutcome": bad_value}],
+                "drug": [],
+            },
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["reactions"] == [{"term": "NAUSEA", "outcome_code": None}]
+
+    def test_flatten_results_reactions_valid_boundary_codes(self, client):
+        """reactionoutcome codes 1 and 6 (the valid boundary values) parse correctly."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-202",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "patient": {
+                "reaction": [
+                    {"reactionmeddrapt": "RASH", "reactionoutcome": "1"},
+                    {"reactionmeddrapt": "FATIGUE", "reactionoutcome": "6"},
+                ],
+                "drug": [],
+            },
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["reactions"] == [
+            {"term": "RASH", "outcome_code": 1},
+            {"term": "FATIGUE", "outcome_code": 6},
+        ]
+
+    def test_flatten_results_symptom_list_unaffected_by_reactions_addition(self, client, mock_fda_response):
+        """Adding 'reactions' must not change symptom_list, symptoms, drug_names, or any
+        other previously-existing key's output — byte-for-byte unaffected."""
+        flat = client._flatten_results(mock_fda_response)
+        assert flat[0]["symptom_list"] == ["CARDIAC ARREST", "DEATH"]
+        assert flat[0]["symptoms"] == "CARDIAC ARREST, DEATH"
+        assert flat[1]["symptom_list"] == ["HEPATOTOXICITY"]
+        assert flat[2]["symptom_list"] == ["NAUSEA", "FATIGUE"]
+        assert flat[3]["symptom_list"] == ["HEADACHE"]
+        required_keys = {"report_id", "date", "severity", "is_death", "is_hospitalization",
+                          "symptoms", "company", "symptom_list", "drug_names",
+                          "safetyreportversion", "reactions"}
+        for report in flat:
+            assert required_keys.issubset(report.keys())
+
 
 # ── Label Text + Class/Peer Discovery ─────────────────────────────────────
 
