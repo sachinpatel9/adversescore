@@ -17,3 +17,6 @@ python-docx>=1.2.0
 #Front End
 streamlit
 plotly>=5.18.0
+
+# Dev/Test only (not required at runtime) — coverage audits, e.g. Phase 11 dedup/ranking gap analysis
+pytest-cov>=5.0.0

@@ -67,6 +67,22 @@ class TestSeriousnessIsPrimarySortKey:
         assert by_symptom["NON_SERIOUS_SYMPTOM"].prr_metrics["drug_cases"] > \
             by_symptom["DEATH_SYMPTOM"].prr_metrics["drug_cases"]
 
+    def test_seriousness_tier_ignores_reports_not_containing_symptom(self):
+        """Direct unit test of _seriousness_tier_for_symptom's own defensive
+        per-report symptom filter (mirrors the reversibility-tier equivalent test in
+        TestReversibilityTiering). rank_signals() always pre-filters via
+        symptom_to_reports before calling this helper, so without this direct call
+        the guard itself — 'a death report for a DIFFERENT symptom must never leak
+        into this symptom's seriousness tier' — is never actually exercised."""
+        from adverse_score.ranking import _seriousness_tier_for_symptom
+
+        reports = [
+            _report("R1", ["OTHER_SYMPTOM"], is_death=True, severity="Serious"),
+            _report("R2", ["TARGET_SYMPTOM"], severity="Non-Serious"),
+        ]
+        tier = _seriousness_tier_for_symptom(reports, "TARGET_SYMPTOM")
+        assert tier == "NON_SERIOUS"
+
 
 class TestLabelStatusTieBreak:
     """Two signals identical in every other criterion: UNLABELED ranks above LABELED."""
@@ -188,6 +204,36 @@ class TestReversibilityTiering:
         by_symptom = {s.symptom: s for s in result.ranked_signals}
         assert by_symptom["SYMPTOM_A"].reversibility_tier == "FATAL"
         assert by_symptom["SYMPTOM_B"].reversibility_tier == "REVERSIBLE"
+
+    def test_unknown_outcome_code_present_tiers_unknown_not_reversible(self):
+        """A report that DOES supply a reactionoutcome code, but one that maps to
+        FAERS's own 'Unknown' bucket (code 6, REACTION_OUTCOME_UNKNOWN_CODE), must
+        still tier as UNKNOWN. This is a distinct code path from 'no code supplied at
+        all' (tested above via outcome_code=None) — here codes_seen is non-empty, so
+        the tiering must fall through _code_tier's final branch rather than the
+        early-return on an empty codes_seen list."""
+        reports = [
+            _report("R1", ["MYSTERY_EVENT"], reactions=[{"term": "MYSTERY_EVENT", "outcome_code": 6}]),
+        ]
+        result = rank_signals(reports, {"MYSTERY_EVENT": 500}, label_text="")
+        assert result.ranked_signals[0].reversibility_tier == "UNKNOWN"
+
+    def test_reversibility_tier_ignores_reports_not_containing_symptom(self):
+        """Direct unit test of _reversibility_tier_for_symptom's own defensive
+        per-report symptom filter. rank_signals() always pre-filters the report list
+        via symptom_to_reports before calling this helper, so this guard is otherwise
+        never exercised by any rank_signals()-level test — but the helper is called
+        directly here (as the module already does for _strength_of_evidence_tier
+        above) to confirm the guard itself is correct: an unrelated report's FATAL
+        outcome must never leak into a different symptom's reversibility tier."""
+        from adverse_score.ranking import _reversibility_tier_for_symptom
+
+        reports = [
+            _report("R1", ["OTHER_SYMPTOM"], reactions=[{"term": "OTHER_SYMPTOM", "outcome_code": 5}]),
+            _report("R2", ["TARGET_SYMPTOM"], reactions=[{"term": "TARGET_SYMPTOM", "outcome_code": 1}]),
+        ]
+        tier = _reversibility_tier_for_symptom(reports, "TARGET_SYMPTOM")
+        assert tier == "REVERSIBLE"
 
 
 class TestPublicHealthTiering:

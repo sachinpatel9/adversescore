@@ -1,217 +1,244 @@
-# AdverseScore: PSUR Consolidation Agent (Under Rebuild)
+# AdverseScore
 
-**AdverseScore** is an agentic pharmacovigilance tool for consolidating FAERS adverse event data into Periodic Safety Update Reports (PSURs). Given a drug name and reporting period, it resolves the drug's canonical identity, retrieves and deduplicates case reports, ranks signals deterministically, and exports structured `.docx` documents aligned to ICH E2C(R2) PBRER format. All outputs are marked as draft pending qualified clinical/regulatory review.
+**An agentic pharmacovigilance system that consolidates FDA adverse event data into structured, audit-ready draft safety reports.**
 
-**⚠️ REBUILD IN PROGRESS:** The codebase is undergoing active refactoring per `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Phases 0–9 complete** (Foundation Cleanup, Drug Identity Resolution, Chunked FDA Retrieval, Deduplication, Label Status Classification, Deterministic Ranking Engine, Consolidation Orchestration, Persistence Layer Redesign, Agent Orchestration & Guardrails, Document Generation); **Phases 10–11 pending** (new UI, full validation). The Streamlit chat is currently a placeholder. The old five-capability system (Score Explainability, Signal Narrative Generator, Temporal Trend Analysis, Comparative Scorecard) has been removed and will **not** be rebuilt in this iteration.
+Give AdverseScore a drug name and a reporting period. It resolves the drug's true identity, retrieves the *complete* set of FDA Adverse Event Reporting System (FAERS) case reports for that period (not a sample), deduplicates them, ranks every distinct safety signal deterministically across four clinical criteria, and exports a structured `.docx` document aligned to the ICH E2C(R2) Periodic Benefit-Risk Evaluation Report (PBRER) format — with every claim traceable back to real retrieved data.
 
+It is built for pharmacovigilance (PV) analysts and safety teams who need to turn raw FAERS data into a defensible starting point for a Periodic Safety Update Report (PSUR), without waiting on a manual, spreadsheet-driven consolidation pass — and without the black-box risk of an AI system quietly inventing a number and calling it "risk."
 
-## What's Built (Phase 0–9)
+> **Status:** Core pipeline, conversational agent, and document export are built and live-tested end to end across multiple drugs and reporting periods. All outputs are draft-marked and require sign-off by a qualified clinical/regulatory professional before any downstream use — see [Disclaimer](#disclaimer).
 
-### Phase 0: Foundation Cleanup
-Removed all code tied to the old five-capability system (composite scoring, narrative generation, temporal trend charts, portfolio scorecard, history panel). The repository is now clean slate for the PSUR consolidation rebuild.
+---
 
-### Phase 1: Drug Identity Resolution
-Given a raw drug name input (e.g., "KEYTRUDA", "keytruda", "pembrolizumab"), the `drug_identity.py` module resolves it to:
-- **Canonical brand/generic name variants** via openFDA label/NDC queries (exact match, then broadened)
-- **Market authorization (FDA approval) date** via `drug/drugsfda.json` (earliest submission_status_date across matched NDAs/ANDAs/BLAs with approval status)
-- **Resolution confidence** (`EXACT`, `FUZZY`, or `PARTIAL`) — `PARTIAL` when OTC monograph drugs are found (no drugsfda entry exists, but name variants are known)
-- **Clear structured errors** if the drug is not found (not a silent empty result)
+## Why AdverseScore
 
-This bounds misspelling tolerance to openFDA's own Lucene search grammar; no custom fuzzy-matching library was added.
+Pharmacovigilance signal detection today typically means an analyst manually pulling FAERS data, wrestling with pagination limits, deduplicating case reports by hand, and applying inconsistent judgment calls about what counts as "serious." It's slow, hard to reproduce, and hard to audit after the fact.
 
-### Phase 2: Chunked, Paginated FDA Retrieval
-Given resolved drug identity (name variants + market authorization date), retrieves ALL FAERS adverse event reports across a PSUR reporting period, safely within openFDA's pagination limits. Replaces the old single-page "500 record representative sample" approach:
-- **IBD-anchored period computation** — PSUR cycles anchored to the drug's market authorization date (International Birth Date in ICH E2C(R2) terminology), selecting the most recently *completed* fixed-length cycle (6-month, 1-year, 2-year, or 3-year)
-- **Quarterly chunking** — Slices PSUR period into sub-chunks (default 3-month windows), labeled with explicit date ranges (`chunk-{i}-YYYYMMDD-to-YYYYMMDD`)
-- **Pagination with ceiling** — Paginates each chunk using `skip`/`limit`, capped at 25,000 (openFDA hard limit). Flags chunks as `truncated=True` if ceiling is hit; per-chunk errors don't abort other chunks
-- **Boundary-collision dedup** — Version-aware merge on `report_id` across chunks to handle inclusive date-range boundaries (chunk i and i+1 may share an event_date if it lands exactly on the boundary); higher `safetyreportversion` wins on collision
-- **OTC fallback** — For OTC monograph drugs (no market authorization date) or drugs approved less than one full period ago (no completed cycle yet), falls back to rolling lookback from today (flagged with reason)
+The obvious AI-era shortcut — feed the raw data to an LLM and ask for a risk score — is the wrong answer in a regulated domain. A single opaque number that mixes seriousness, evidence strength, and volume into one score is not defensible to a regulator, and an LLM asked to "just tell me the risk" will happily state things with more confidence than the underlying data supports.
 
-Returns `PSURRetrievalResult` with per-chunk metadata (retrieved/estimated counts, truncation flags, optional per-chunk errors) and merged report list. No circular imports with `drug_identity.py` — accepts plain primitives (name variants list, optional date, period string).
+AdverseScore takes a different position: **deterministic math does the ranking, the LLM only narrates it.** Every signal's position in the output is fully explainable by re-running the same fixed formula against the same data — no LLM call is in that loop at all. The LLM's job is strictly downstream: summarizing what the math already decided, in plain language, with guardrails that prevent it from asserting causation or inventing findings not present in the data.
 
-### Phase 3: Deduplication
-Given a flattened list of FAERS case reports (from Phase 2's `fetch_psur_reports()`), the `deduplication.py` module removes duplicates in two passes:
-- **Exact `safetyreportid` matching with version awareness** — Groups reports by `report_id`, keeps the highest `safetyreportversion` per ID. Reports with missing/`None` `report_id` receive unique synthetic keys and never collapse into each other (defensive measure against malformed upstream data).
-- **Fallback heuristic matching on survivors** — Two reports with *different* `report_id`s are treated as duplicates only if their full normalized `drug_names` set AND full normalized `symptom_list` set AND `receivedate` are ALL identical (deliberately strict to avoid over-merging genuinely distinct multi-symptom cases). Reports with empty `drug_names` or empty `symptom_list` are excluded from heuristic matching.
+---
 
-Returns `DedupResult` with original reports, input/output counts, per-method removal counts, and audit trail (list of removal decisions). Known limitation: `date` is `receivedate` (FDA receipt date), not a true per-reaction adverse-event onset date — FAERS lacks a single unambiguous event date, so this is the proxy used here and elsewhere in the codebase.
+## Core Capabilities
 
-### Phase 4: Label Status Classification
-Given a PSUR's merged, deduplicated symptom list and a drug's FDA label text, the `label_classifier.py` module classifies each symptom as LABELED, UNLABELED, or LABEL_STATUS_UNKNOWN (substring match on lowercased label). Phase 4 adds a batch processing function `classify_label_statuses()` alongside the existing single-symptom `classify_label_status()`, enabling efficient classification of all unique symptoms at once for Phase 5 ranking consumption. The batch function normalizes symptoms (uppercase, deduplicate case-insensitively, sort for determinism, filter empty), iterates once per unique symptom, and returns a frozen dataclass with per-symptom status mapping plus aggregate counts. The frozen dataclass prevents accidental mutation downstream; input symptom list is never modified.
+- **Canonical drug identity resolution** — resolves misspellings, brand names, and generic names to a single verified identity, including the drug's true market authorization date, via openFDA's own label/NDC/`drugsfda.json` data.
+- **Complete FAERS retrieval, not a sample** — retrieves every matching case report across a full PSUR reporting period (6mo / 1yr / 2yr / 3yr), safely navigating openFDA's per-query pagination ceiling via automatic chunking, with explicit truncation flags if any window is genuinely too large to fully retrieve.
+- **Two-pass deduplication with a full audit trail** — exact case-ID matching (version-aware) plus a deliberately conservative heuristic fallback pass, so near-duplicate reports don't inflate signal counts, without ever risking over-merging genuinely distinct cases.
+- **Deterministic, explainable signal ranking** — every unique adverse event is ranked across four independent, clinically meaningful tiers (see [Technical Innovations](#technical-innovations)) — with **no single composite risk score**, by design.
+- **Conversational follow-up, grounded in the real dataset** — ask follow-up questions about a consolidation ("show me just the serious ones," "what's unlabeled?") without re-querying FDA; the agent reuses the already-retrieved data for the session.
+- **Regulatory-format document export** — one click produces a draft `.docx` aligned to the real ICH E2C(R2) PBRER structure, with the full ranked signal list, methodology transparency, and mandatory draft marking embedded directly in the file.
+- **Cross-session memory** — every consolidation and every conversation turn is persisted, so an analyst can pick up a prior session days later without re-running retrieval.
 
-### Phase 5: Deterministic Ranking Engine
-Given deduplicated FAERS reports, outcome-code metadata, label classification results, and PRR metrics, the `ranking.py` module ranks all unique adverse event signals (MedDRA PT symptoms) across four lexicographically-ordered tiers:
-- **Seriousness & Outcome** — DEATH > HOSPITALIZATION > OTHER_SERIOUS > NON_SERIOUS, derived from existing report severity fields
-- **Strength of Evidence** — STRONG_UNLABELED > STRONG_LABELED > WEAK_UNLABELED > WEAK_LABELED > UNKNOWN_LABEL_STATUS, reusing PRR math with unlabeled signals outranking labeled ones at equivalent strength
-- **Reversibility** — FATAL > POOR > REVERSIBLE > UNKNOWN, derived from newly-extracted per-reaction FAERS outcome codes (1–6)
-- **Public Health Impact** — HIGH (100+ reports) > MODERATE (20–99 reports) > LOW (<20 reports), a proxy for exposure
+---
 
-Returns `RankingResult` containing a globally-ranked list of `RankedSignal` objects (each with tier names, PRR metrics, report count) plus label summary and formula version for audit trail. **Critical design:** The ranking uses an internal lexicographic sort key (tuple of tier ordinals) for determinism, but this key is never stored or exposed on output dataclasses — the four tier names are exposed as human-readable strings only. This design explicitly avoids the scope doc's ban on a single composite "AdverseScore" risk number while maintaining reproducibility and auditability.
+## Technical Innovations
 
-### Phase 6: Consolidation Orchestration
-Single pipeline entry point `consolidate_psur()` wires Phases 1–5 together into one coherent, callable workflow. Accepts a drug name and PSUR period, resolves the drug's identity, retrieves and deduplicates all FAERS reports across the period, classifies symptom labels, and ranks signals across four criteria. Returns `ConsolidationResult` with ranked signals (including per-criterion breakdown), completeness metadata (retrieved vs. estimated report counts, per-chunk truncation flags), deduplication statistics, label status breakdown, and ranking formula version for audit trail. Gracefully handles errors throughout the pipeline via structured `ConsolidationError` (never raises for domain failures). Tested end-to-end against live FAERS data: real consolidation of KEYTRUDA (8,204 reports retrieved, 7,903 after dedup, 2,547 unique signals ranked).
+A few design decisions in this system are worth calling out specifically, because they're the parts that would be easy to get wrong in a regulated, LLM-adjacent product:
 
-### Phase 7: Persistence Layer Redesign
-SQLite-backed persistence enabling cross-session memory for multi-turn follow-ups without re-querying FDA. `ConsolidationStore` class (renamed from `AnalysisStore`) manages two tables: `consolidations` (canonical_name, period, result_json with full nested `ConsolidationResult`), indexed on (canonical_name, period, created_at DESC) for efficient "latest" lookup; `conversation_messages` (session_id, role, content, optional consolidation_id link), indexed on (session_id, id) and ordered by insertion order to avoid same-timestamp collisions. Serialization via `dataclasses.asdict()` with two deliberate post-processing steps: (1) `DrugIdentity.market_authorization_date` (date object) ↔ ISO string (None passes through for OTC drugs); (2) `PSURRetrievalResult.chunks[].reports` trimmed to `[]` on save — a documented exception to round-trip fidelity since this data is redundant (already in merged/deduplicated report lists) and would cause ~2–3x storage bloat for high-volume drugs. Deserialization reconstructs full `ConsolidationResult` objects (not plain dicts) indistinguishable from freshly-returned ones. New public methods: `save_consolidation()` (inserts new row every time, never overwrites — full history retained for audit trail), `load_consolidation()`, `get_latest_consolidation()`, `list_consolidations()` (lightweight metadata for "resume session" UI), `save_message()`, `get_conversation_history()`. Tests: 18 tests covering schema creation, full round-trip fidelity on real nested instances, None market-authorization-date handling, empty signals, multiple saves without overwriting, filtering, and session ordering.
+**1. Deterministic ranking with zero composite score.**
+Signals are ranked by a strict, lexicographic four-tier sort — Seriousness & Outcome → Strength of Evidence → Reversibility → Public Health Impact — where each tier is a fully independent, human-readable classification (e.g. `DEATH`, `STRONG_UNLABELED`, `FATAL`, `HIGH`), not a weighted number folded into anything else. The sort key exists only internally; it is never stored or exposed. This means the *entire* ranking is reproducible by hand from the four published tier values — there is nothing hidden in a formula only the system can see.
 
-### Phase 8: Agent Orchestration & Guardrails
-LangGraph-based multi-turn conversational agent with embedded guardrails enforcing clinical/regulatory safety. Entry point: `run_agent_turn(conversation_history, user_message, in_session_dataset)` — a pure function returning `AgentTurnResult` (response_text, updated_dataset, dataset_changed flag). Orchestrator manages two agent tools: `resolve_drug_identity_tool()` for lightweight identity questions and `consolidate_psur_tool()` (primary data gathering, returns top 20 ranked signals + completeness metadata to avoid LLM context bloat). Novel technical pattern: contextvars-based capture mechanism (ContextVar-held per-call list) carries full `ConsolidationResult` across LangGraph's tool-node boundary (threading.local() doesn't work because nodes run on different worker thread). Guardrail enforcement uses hybrid model: Guardrails 1 (Causality Lock) & 7 (Scope Enforcement) are system-prompt-enforced with log-only defense-in-depth (`_flag_causal_language()` function); Guardrails 4/5/6 (Human Review Requirement, Completeness Transparency, Formula Version Audit Trail) are code-enforced unconditionally at turn-end via deterministic disclosure functions (sourced from real `ConsolidationResult` fields, never LLM-generated); Guardrails 2/3 (No-Fabrication Placeholder, Draft Marking) deferred to Phase 9 (document generation). Config additions: `OPENAI_CHAT_MODEL="gpt-4o"`, `AGENT_TEMPERATURE=0.1`, `AGENT_MAX_ITERATIONS=5`. Installed LangGraph 1.1.0, LangChain 1.2.11, langchain-openai 1.1.11. Multi-turn follow-ups reuse in-session dataset without re-fetching FDA. Tests: 38 unit tests + 2 E2E tests covering guardrail post-processing, causal-language flagging, tool-calling flow with mocked LLM, dataset carry-forward semantics, iteration-cap enforcement, no-persistence-import safety, and multi-turn dataset reuse against live APIs.
+**2. Real completeness, not a representative sample.**
+Most integrations with the openFDA API accept its default page-limit sampling and quietly present a partial picture as if it were the whole one. AdverseScore instead anchors each PSUR reporting period to the drug's actual market authorization date (its International Birth Date, in ICH terms), slices that period into sub-windows, and paginates each window up to FDA's hard ceiling — explicitly flagging any window where even that wasn't enough, rather than silently truncating.
 
-### Phase 9: Document Generation
-Generates `.docx` PSUR documents in ICH E2C(R2) PBRER format (20 sections + appendices), verified against the official guideline PDF. Entry point: `generate_psur_document(result: ConsolidationResult) -> Document` returns a `python-docx` Document object for caller to save or stream. Trimmed-subset design: Sections 1 (Introduction: canonical name, brand/generic variants, market authorization date, therapeutic class, reporting period) and 6 (Data in Summary Tabulations: retrieved/estimated counts, per-chunk truncation flags, dedup methodology and stats) capture identity and completeness. Section 15 (Overview of Signals) contains the full ranked-signal table (uncapped, unlike Phase 8's 20-signal chat narration) with one LLM-narrated introductory paragraph. Sections 16.1–16.3 (Signal Evaluation) feature LLM-narrated text grounded in label-status classification and PRR-ranking data, explicitly framed as evidentiary input requiring clinical validation, not a completed evaluation. All remaining sections (2–5, 7–14, 16.4–19, 20/Appendices) use one consolidated literal placeholder note (Guardrail 2). Draft marking embedded structurally twice: docx header/footer objects AND cover-page body paragraph (Guardrail 3). Completeness metadata, ranking formula version, and mandatory human-review requirement appended deterministically (Guardrails 4, 5, 6). LLM narration via single `_narrate_signals()` call with `DOCUMENT_NARRATION_TEMPERATURE = 0.0` for faithfulness; fabrication guardrails include `_check_narration_for_fabricated_entities` (allowed-vocabulary scan) and reimplemented causal-language flagging (never depends on Phase 8 orchestrator). Two review-phase bugs found and fixed: (1) Section 20 gap in omitted-sections note covering (fixed by extending note, verified via full 1-20 accounting). (2) False-suppression bug on deterministic "evidentiary input, not completed" disclaimer (required both markers before skipping append, preventing accidental suppression). New config constants: `DOCUMENT_NARRATION_TEMPERATURE`, `PBRER_PLACEHOLDER_TEXT`, `PBRER_DRAFT_MARKING_TEXT`, `PBRER_OMITTED_SECTIONS_NOTE`. New dependency: `python-docx` 1.2.0. Tests: 34 unit tests covering section headers present, placeholder byte-exact, draft marking structural checks, completeness/formula version from real fixtures, full ranked-signal table, OTC/None date handling, empty signals, and guardrail functions tested directly. E2E: 1 live test with KEYTRUDA/6mo producing 2,548-row signal table in 84KB `.docx` file.
+**3. A hybrid safety architecture for the LLM layer.**
+Some safety properties (never asserting drug-caused-event causation, staying in scope) are semantic judgments that only a well-instructed LLM can make — so those are prompt-enforced with logged, non-blocking defense-in-depth monitoring. Other properties (disclosing data completeness, stating which ranking formula version produced this output, requiring human review) are non-negotiable and don't require judgment — so those are enforced deterministically in code, appended to every relevant response regardless of what the LLM said, sourced directly from the real underlying data. The system doesn't trust the LLM with guarantees code can make instead.
 
+**4. A real ICH E2C(R2) PBRER structure, not an approximation.**
+The exported document's section structure was built against the actual ICH guideline text (20 numbered sections, verified section-by-section), not a remembered or inferred approximation of it. Sections the system has real data for are populated; every other section carries a fixed, literal, non-LLM-generated placeholder — the model is structurally incapable of writing prose into a section it has no data for.
 
-## Planned Architecture (Phases 10–11)
+**5. Full retrieved dataset survives across a multi-turn conversation without re-fetching.**
+A PV analyst's natural workflow is exploratory — "show me the serious ones," "what about unlabeled events?" The agent answers these from the dataset already in memory for that session rather than re-hitting FDA on every question, which matters both for cost/latency and for guaranteeing that follow-up answers are consistent with the first answer instead of drifting across separate live queries.
 
-The full PSUR consolidation workflow (currently under build) will combine:
+---
 
-1. ✅ **Chunked FDA Retrieval** (Phase 2, DONE) — Break PSUR periods into quarterly chunks to stay within openFDA's 25K-record skip ceiling; retrieve and merge results, flagging any per-chunk truncation.
-2. ✅ **Deduplication** (Phase 3, DONE) — Match case reports on exact `safetyreportid` with version awareness, with fallback heuristic matching (full-set equality on normalized drug names + symptom list + receipt date) for FAERS ID gaps. Audit trail of all removal decisions included in output.
-3. ✅ **Label Status Classification** (Phase 4, DONE) — Batch classify symptoms as LABELED/UNLABELED/LABEL_STATUS_UNKNOWN via substring match against FDA label text. Normalize symptom input (uppercase, deduplicate, sort), return frozen dataclass with per-symptom status and aggregate counts.
-4. ✅ **Signal Ranking** (Phase 5, DONE) — Deterministic 4-criteria ranking (Seriousness & Outcome, Strength of Evidence, Reversibility, Public Health Impact), using reusable PRR math + label-status weighting, with lexicographic tier sort and no composite score. The LLM's role is **only to narrate** the pre-computed ranking, not to compute or override it.
-5. ✅ **Persistence Layer** (Phase 7, DONE) — SQLite schema for consolidated datasets + conversation history, enabling multi-turn follow-ups on cached data without re-querying FDA.
-6. ✅ **Agent Orchestration & Guardrails** (Phase 8, DONE) — Multi-turn LangGraph agent with 7-guardrail system prompt (hybrid prompt + code enforcement), reusing in-session consolidated data for follow-ups.
-7. ✅ **Document Generation** (Phase 9, DONE) — Produce `.docx` files with ICH E2C(R2) PBRER structure: signal-related sections populated with real data, all other sections filled with explicit placeholders (per Guardrail 2). Embedded guardrails: draft marking (Guardrail 3), completeness metadata (Guardrail 5), ranking formula version (Guardrail 6).
-8. **New UI & Full Validation** (Phases 10–11) — Streamlit UI with PSUR period selector and ranked-signal display; comprehensive unit/E2E test pass and manual guardrail audit.
+## System Architecture
 
-See `docs/PSUR_CONSOLIDATION_SCOPE.md` for the complete 11-phase spec including known limitations, assumptions, and implementation details.
+```
+Drug name + reporting period
+        │
+        ▼
+┌─────────────────────┐
+│ Identity Resolution  │  brand/generic name variants + market authorization date
+└─────────┬────────────┘
+          ▼
+┌─────────────────────┐
+│  Chunked Retrieval   │  full-period FAERS pull, paginated, ceiling-flagged
+└─────────┬────────────┘
+          ▼
+┌─────────────────────┐
+│   Deduplication      │  exact-ID + conservative heuristic pass, audit trail
+└─────────┬────────────┘
+          ▼
+┌─────────────────────┐
+│ Label Classification │  LABELED / UNLABELED against real FDA label text
+└─────────┬────────────┘
+          ▼
+┌─────────────────────┐
+│ Deterministic Ranking│  4-tier lexicographic sort, no composite score
+└─────────┬────────────┘
+          ▼
+   ConsolidationResult ──────────────┬──────────────────┐
+          │                          │                  │
+          ▼                          ▼                  ▼
+┌──────────────────┐      ┌──────────────────┐  ┌──────────────────┐
+│  Persistence      │      │  Conversational   │  │  Document Export  │
+│  (SQLite, full     │◄────┤  Agent (LangGraph, │  │  (.docx, ICH E2C   │
+│  history retained) │     │  hybrid guardrails)│  │  (R2) PBRER format)│
+└──────────────────┘      └──────────────────┘  └──────────────────┘
+```
 
+Each stage above is a separate, independently tested Python module with no hidden coupling — the ranking engine, for instance, has zero HTTP dependency and zero LLM dependency, so it can be verified as pure, deterministic math in isolation.
 
-## System Architecture (Current State)
+<details>
+<summary><b>Full module reference</b></summary>
 
 ```text
 adversescore/
-├── app.py                                 # Streamlit UI (placeholder, to be rebuilt Phases 10–11)
-├── src/
-│   └── adverse_score/
-│       ├── config.py                      # API keys + named constants (Phase 1–2, 5, 8, 9 additions)
-│       ├── drug_identity.py               # Drug resolution (Phase 1)
-│       ├── fda_client.py                  # openFDA HTTP client + PSUR chunked retrieval (Phase 2, 5)
-│       ├── deduplication.py               # Deduplication engine (Phase 3)
-│       ├── ranking.py                     # Deterministic signal ranking engine (Phase 5)
-│       ├── consolidation.py               # Consolidation pipeline entry point (Phase 6)
-│       ├── client.py                      # Reduced orchestrator (removed scoring methods)
-│       ├── prr.py                         # PRR + Wald 95% CI (unchanged)
-│       ├── label_classifier.py            # Label classification only (removed penalty)
-│       ├── agent_tools.py                 # LangGraph agent tools, contextvars capture box (Phase 8)
-│       ├── orchestrator.py                # LangGraph multi-turn agent with guardrails (Phase 8)
-│       ├── persistence.py                 # SQLite persistence + conversation history (Phase 7)
-│       ├── document_generator.py          # `.docx` PBRER-aligned PSUR document generation (Phase 9)
-│       └── logger.py                      # JSON-structured logging (unchanged)
-├── data/                                  # SQLite DB (auto-created, gitignored)
-├── docs/
-│   └── PSUR_CONSOLIDATION_SCOPE.md        # Authoritative 11-phase rebuild spec
+├── app.py                          # Streamlit UI — period selector, identity/completeness cards,
+│                                    # ranked signal table, chat, .docx export
+├── src/adverse_score/
+│   ├── config.py                   # Named constants: API config, retrieval/dedup/ranking tunables
+│   ├── drug_identity.py            # Canonical name + market authorization date resolution
+│   ├── fda_client.py               # openFDA client, IBD-anchored chunked/paginated retrieval
+│   ├── deduplication.py            # Exact-ID + heuristic dedup, audit trail
+│   ├── prr.py                      # Proportional Reporting Ratio + Wald 95% CI math
+│   ├── label_classifier.py         # LABELED/UNLABELED classification vs. FDA label text
+│   ├── ranking.py                  # Deterministic 4-tier signal ranking engine
+│   ├── consolidation.py            # Single pipeline entry point (identity → ranking)
+│   ├── persistence.py              # SQLite: consolidated datasets + conversation history
+│   ├── agent_tools.py              # LangGraph tool wrappers around the pipeline
+│   ├── orchestrator.py             # Multi-turn conversational agent + guardrail enforcement
+│   ├── document_generator.py       # ICH E2C(R2) PBRER .docx generation
+│   └── logger.py                   # Structured JSON logging
 ├── tests/
-│   ├── conftest.py                        # Pytest fixtures
-│   ├── unit/
-│   │   ├── test_fda_client.py             # Includes Phase 2 PSUR chunking tests, Phase 3 flatten/merge tests
-│   │   ├── test_deduplication.py          # Phase 3 deduplication tests
-│   │   ├── test_prr.py
-│   │   ├── test_label_classifier.py
-│   │   ├── test_persistence.py
-│   │   ├── test_orchestrator.py
-│   │   ├── test_agent_tools.py
-│   │   ├── test_drug_identity.py          # Phase 1
-│   │   ├── test_consolidation.py          # Phase 6 pipeline integration tests
-│   │   └── test_document_generator.py     # Phase 9 document generation tests
-│   └── e2e/
-│       ├── test_fda_client_e2e.py
-│       ├── test_fda_client_psur_e2e.py    # Phase 2
-│       ├── test_deduplication_e2e.py      # Phase 3
-│       ├── test_prr_e2e.py
-│       ├── test_drug_identity_e2e.py      # Phase 1
-│       ├── test_consolidation_e2e.py      # Phase 6 end-to-end live FDA test
-│       ├── test_orchestrator_e2e.py       # Phase 8 multi-turn agent test
-│       └── test_document_generator_e2e.py # Phase 9 document generation E2E test
-├── pytest.ini                             # pythonpath=src tests, testpaths=tests
-├── requirements.txt                       # Dependencies
-└── .env                                   # API keys (gitignored)
+│   ├── unit/                       # 233 tests, no live API calls required
+│   └── e2e/                        # 20 tests against live openFDA + OpenAI APIs
+├── docs/
+│   └── PSUR_CONSOLIDATION_SCOPE.md # Authoritative build specification
+├── pytest.ini
+└── requirements.txt
 ```
 
+</details>
 
-## Clinical Guardrails (New Framework)
+---
 
-The shift from "informational chat" to "artifact resembling regulatory documentation" demands stricter safety controls. The rebuilt system will enforce seven guardrails (to be implemented in Phase 8):
+## Guardrails & Safety Architecture
 
-1. **Causality Lock** — No causal assertions between drug and adverse event; only statistical association and signal strength. No medication changes, dosing recommendations, or patient-level clinical action.
-2. **No-Fabrication Placeholder Rule** — PBRER sections without real consolidated data receive fixed, literal, non-LLM-generated placeholders (e.g., `[Section not populated by AdverseScore — to be completed by Regulatory Affairs]`).
-3. **Mandatory Document-Level Draft Marking** — Every exported `.docx` carries prominent, structurally embedded draft disclaimers in cover section and running headers.
-4. **Universal Human Review Requirement** — All generated PSUR documents require clinical/regulatory sign-off before use, regardless of signal severity.
-5. **Completeness & Methodology Transparency** — Retrieved-vs-total counts, per-chunk truncation flags, and deduplication method details are embedded in the exported document, not just spoken in conversation.
-6. **Ranking Formula Version Audit Trail** — The document records which version of the deterministic ranking formula produced the results, supporting auditability.
-7. **Scope Enforcement** — The agent declines and redirects any request outside PSUR consolidation (general medical advice, prescribing guidance, unrelated drugs).
+Producing anything that resembles regulatory documentation demands controls well beyond a typical chat assistant. AdverseScore enforces seven guardrails, each mapped to how it's actually guaranteed:
 
-See `docs/PSUR_CONSOLIDATION_SCOPE.md` Section 4 for full guardrail definitions and clinical rationale.
+| # | Guardrail | What it prevents | How it's enforced |
+|---|---|---|---|
+| 1 | **Causality Lock** | The system stating or implying a drug *caused* an event — only statistical association is ever claimed | Prompt-enforced, with logged pattern-matching as a monitoring layer |
+| 2 | **No-Fabrication Placeholder** | The LLM writing plausible-sounding prose into a report section it has no real data for | Code-enforced — a fixed, literal, non-LLM-generated string is inserted structurally; the model never sees those sections |
+| 3 | **Mandatory Draft Marking** | A generated document being mistaken for a final, submission-ready report | Code-enforced — embedded in the document's cover section *and* running header/footer, so it travels with the file even if separated from its source conversation |
+| 4 | **Universal Human Review** | Any output being used without qualified sign-off, regardless of how the signals look | Code-enforced — appended deterministically to every response referencing a dataset |
+| 5 | **Completeness & Methodology Transparency** | Silent, undisclosed data gaps (e.g. an over-large retrieval window) | Code-enforced — retrieved-vs-estimated counts and truncation status are sourced from real retrieval metadata, never LLM-stated |
+| 6 | **Ranking Formula Version Audit Trail** | Losing the ability to reproduce or challenge a prior ranking after the formula changes | Code-enforced — every output is tagged with the exact formula version that produced it |
+| 7 | **Scope Enforcement** | The system drifting into general medical advice, dosing guidance, or unrelated drug questions | Prompt-enforced, with logged pattern-matching as a monitoring layer |
 
+Guardrails 1 and 7 rely on the LLM correctly following instructions — because whether something constitutes a causal claim or an out-of-scope request is a judgment call, not a string match. Guardrails 2 through 6 make no such assumption: they are structurally guaranteed by code that runs regardless of what the model outputs, sourced directly from the real underlying data. This split is deliberate — it puts the LLM's judgment where judgment is actually required, and puts hard guarantees everywhere else.
+
+Full guardrail definitions and clinical rationale: `docs/PSUR_CONSOLIDATION_SCOPE.md`, Section 4.
+
+---
 
 ## Getting Started
 
 ### Prerequisites
-* Python 3.10+
-* openFDA API Key ([request here](https://open.fda.gov/apis/authentication/))
-* OpenAI API Key (GPT-4o) — required only when Phase 8+ agent is available
+- Python 3.10+
+- An [openFDA API key](https://open.fda.gov/apis/authentication/)
+- An OpenAI API key (for the conversational agent and document narration)
 
-### Installation
-1. Clone the Repository
+### Setup
+
 ```bash
 git clone https://github.com/sachinpatel9/adversescore.git
 cd adversescore
-```
-
-2. Install Dependencies
-```bash
 pip install -r requirements.txt
 ```
 
-3. Configure Environment (for now, only openFDA key is required)
+Create a `.env` file in the repo root:
 
-Create a `.env` file in the root directory:
 ```
 OPENFDA_API_KEY=your_fda_key_here
-# OPENAI_API_KEY=your_openai_key_here  (required in Phase 8+)
+OPENAI_API_KEY=your_openai_key_here
 ```
 
-4. Running Tests (Current Recommendation)
-Since the Streamlit UI is a placeholder, focus on running the test suite to validate the current Phase 0–5 work:
+### Run it
 
 ```bash
-# Unit tests only (fast, no API keys required)
+streamlit run app.py
+```
+
+Enter a drug name, pick a reporting period, and click **Run Consolidation**. From there: review the identity resolution and data completeness cards, browse the ranked signal table, ask follow-up questions in the chat, and generate a `.docx` export when ready.
+
+### Run the tests
+
+```bash
+# Unit tests — fast, no API keys required
 pytest tests/unit -v
 
-# E2E integration tests (requires OPENFDA_API_KEY in .env)
+# End-to-end tests against live openFDA + OpenAI APIs
 pytest tests/e2e -v -m e2e
 
 # Full suite
 pytest -v
 ```
 
-**Current test status:** 233 unit tests passing, 20 E2E tests (all passing against live openFDA + OpenAI APIs, including Phase 2 PSUR retrieval, Phase 3 deduplication, Phase 6 consolidation, Phase 7 persistence round-trip, Phase 8 multi-turn agent, and Phase 9 document generation tests).
-
-5. Launching the Placeholder UI (Not Recommended Yet)
-```bash
-streamlit run app.py
-```
-The chat is a placeholder pending Phase 8 completion.
+**Current status:** 233 unit tests, 20 E2E tests, all passing. A live consolidation of KEYTRUDA over a 6-month period retrieves and deduplicates several thousand real FAERS reports and ranks thousands of distinct signals end to end.
 
 ---
 
-## Development Roadmap
+## Current Status
 
-- **Phase 0–1:** ✅ Foundation cleanup, drug identity resolution
-- **Phase 2:** ✅ Chunked FDA retrieval
-- **Phase 3:** ✅ Deduplication engine
-- **Phase 4:** ✅ Label status classification
-- **Phase 5:** ✅ Signal ranking (deterministic 4-criteria)
-- **Phase 6:** ✅ Consolidation orchestration
-- **Phase 7:** ✅ Persistence layer & conversation history
-- **Phase 8:** ✅ Agent orchestration & guardrails
-- **Phase 9:** ✅ `.docx` document generation
-- **Phase 10–11:** Multi-turn UI, full test suite & end-to-end validation
+The full pipeline — identity resolution, chunked retrieval, deduplication, label classification, deterministic ranking, persistence, the conversational agent, document export, and the Streamlit UI — is built and fully tested end-to-end. Multi-drug live validation completed against KEYTRUDA (6-month and 2-year periods, exercising chunking at scale) and HUMIRA (6-month), all producing valid draft `.docx` exports. A structured adversarial guardrail audit confirmed enforcement of all seven safety guardrails, with findings documented in `docs/GUARDRAIL_AUDIT.md`; see `docs/PSUR_CONSOLIDATION_SCOPE.md` for the complete build specification and `docs/TODO.md` for detailed phase results.
 
-See `docs/PSUR_CONSOLIDATION_SCOPE.md` for full details.
+<details>
+<summary><b>Engineering build log (phase-by-phase detail)</b></summary>
+
+### Phase 0: Foundation Cleanup
+Removed all code tied to a prior five-capability system (composite scoring, narrative generation, temporal trend charts, portfolio scorecard, history panel), establishing a clean base for the PSUR consolidation rebuild.
+
+### Phase 1: Drug Identity Resolution
+Resolves a raw drug name input (e.g. "KEYTRUDA", "keytruda", "pembrolizumab") to canonical brand/generic name variants via openFDA label/NDC queries, plus market authorization date via `drug/drugsfda.json`. Returns a resolution confidence (`EXACT`, `FUZZY`, or `PARTIAL` — `PARTIAL` for OTC monograph drugs with no `drugsfda` entry) and a clear structured error if the drug isn't found at all.
+
+### Phase 2: Chunked, Paginated FDA Retrieval
+Retrieves the complete FAERS report set for a PSUR period, replacing a prior single-page "representative sample" approach. PSUR cycles are anchored to the drug's market authorization date (its International Birth Date), sliced into quarterly sub-chunks, and paginated up to openFDA's 25,000-record ceiling per chunk — with explicit truncation flagging and independent per-chunk error isolation. OTC drugs (no market authorization date) fall back to a rolling lookback window.
+
+### Phase 3: Deduplication
+Two-pass deduplication: exact `safetyreportid` matching with version awareness (highest `safetyreportversion` wins), then a deliberately conservative heuristic fallback pass requiring full-set equality on normalized drug names, symptom list, and receipt date — designed to never over-merge genuinely distinct multi-symptom cases. Full audit trail of every removal decision is retained.
+
+### Phase 4: Label Status Classification
+Classifies each unique symptom as `LABELED`, `UNLABELED`, or `LABEL_STATUS_UNKNOWN` against real FDA label text, batch-processed for the full deduplicated symptom set feeding into ranking.
+
+### Phase 5: Deterministic Ranking Engine
+Ranks every unique adverse event signal across four independent, lexicographically-ordered tiers — Seriousness & Outcome, Strength of Evidence, Reversibility, Public Health Impact — with no composite score ever computed or exposed. The internal sort key exists only to produce a stable order; it's never stored on output.
+
+### Phase 6: Consolidation Orchestration
+Single pipeline entry point wiring Phases 1–5 into one callable workflow, returning a fully structured result (ranked signals, completeness metadata, dedup statistics, label breakdown, formula version) or a structured error — never an unhandled exception. Live-tested against KEYTRUDA: 8,204 reports retrieved, 7,903 after dedup, 2,547 unique signals ranked.
+
+### Phase 7: Persistence Layer
+SQLite-backed cross-session memory. Every consolidation is inserted as a new row (never overwritten, preserving full history); conversation messages are stored per session with optional links to the consolidation they discuss. Full round-trip fidelity on save/load, with one documented, deliberate exception (pre-merge per-chunk report lists are trimmed on save since they're a strict subset of already-retained merged/deduplicated data).
+
+### Phase 8: Agent Orchestration & Guardrails
+A LangGraph-based multi-turn conversational agent (`run_agent_turn()`) reusing a session's already-retrieved dataset for follow-up questions instead of re-querying FDA. Implements the hybrid guardrail model described above. A `contextvars`-based capture mechanism carries the full structured result across LangGraph's internal tool-execution boundary (a genuine `threading.local()` limitation discovered and worked around during development).
+
+### Phase 9: Document Generation
+Generates `.docx` PSUR documents in the real, guideline-verified ICH E2C(R2) PBRER structure. Sections with real underlying data (Introduction, Data Summary Tabulations, Signal Overview, partial Signal Evaluation) are populated; every other section receives one fixed, literal, non-LLM-generated placeholder. Draft marking is embedded structurally in both the document header/footer and a cover-page paragraph.
+
+### Phase 10: UI Integration
+A Streamlit application wiring the full pipeline into a usable interface: drug/period controls that call the deterministic pipeline directly (the conversational agent is reserved for follow-ups only, never the initial data-gathering step), identity and completeness cards sourced from real data, a ranked signal table, a two-step document generation/download flow, and a "resume a prior session" feature. Live browser-tested end to end, including a real document download verified to contain the full uncapped signal list and structurally correct draft marking.
+
+### Phase 11: Full Test Suite & End-to-End Validation
+Comprehensive validation confirming all automated tests pass (236 unit, 20 E2E), both deduplication and ranking modules at 100% statement coverage. Multi-drug live validation completed: KEYTRUDA/6mo (8,204 retrieved, 2,547 ranked signals), KEYTRUDA/2yr (31,174 retrieved across quarterly chunks, 4,523 ranked signals — exercising chunking and pagination at scale), HUMIRA/6mo (3,668 retrieved, 2,052 signals). All three produced valid draft `.docx` exports verified by reopening and inspecting signal table row counts. A structured adversarial audit of all seven guardrails confirmed correct enforcement; findings and one deliberate-unfixed open item (multi-turn conversational fabrication) documented in `docs/GUARDRAIL_AUDIT.md`. One high-volume OTC drug (ASPIRIN) timed out during live testing and was deprioritized per product decision; this performance gap remains noted and scoped for future investigation but is non-blocking for the core rebuild.
+
+</details>
 
 ---
 
 ## Disclaimer
 
-**AdverseScore is under active rebuild and currently non-functional as a user-facing tool.** This repository is shared for development transparency and team collaboration. When complete, AdverseScore will be a research-grade tool for generating draft PSUR documents from FAERS data. All outputs require validation by a qualified clinical/regulatory professional before use in regulatory submissions or clinical decisions. AdverseScore is **not** a medical device and does **not** constitute medical advice.
+AdverseScore produces **draft** pharmacovigilance signal consolidations and draft PBRER-aligned documents as evidentiary input for expert review — it does not perform, and is not a substitute for, clinical or regulatory signal evaluation. Every exported document is explicitly marked as a draft pending qualified clinical/regulatory review. AdverseScore is **not** a medical device and does **not** provide medical advice, causal safety determinations, or treatment recommendations. All outputs require validation by a qualified professional before any use in regulatory submissions or clinical decision-making.

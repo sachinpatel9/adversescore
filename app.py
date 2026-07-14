@@ -1,4 +1,7 @@
+import html
+import io
 import sys
+import uuid
 from pathlib import Path
 
 #pointing python to 'srs' directory
@@ -7,15 +10,18 @@ if src_path not in sys.path:
     sys.path.append(src_path)
 
 import streamlit as st
-from adverse_score.orchestrator import agent_executor
+
+from adverse_score.config import TOP_N_NARRATED_SIGNALS
+from adverse_score.consolidation import ConsolidationError, ConsolidationResult, consolidate_psur
+from adverse_score.document_generator import generate_psur_document
+from adverse_score.orchestrator import run_agent_turn
+from adverse_score.persistence import ConsolidationStore
 
 # ── UI Configuration ──────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="AdverseScore Clinical AI", page_icon="⚕️", layout='wide')
 
 # ── Design System ─────────────────────────────────────────────────────────────
-
-_dark = st.session_state.get("dark_mode", False)
 
 st.markdown("""
 <style>
@@ -162,28 +168,6 @@ html, body, [class*="css"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Dark Mode CSS Overrides ───────────────────────────────────────────────────
-if _dark:
-    st.markdown("""
-    <style>
-    :root {
-        --color-bg-page: #0f1117;
-        --color-surface: #1e1e2e;
-        --color-text: #e5e7eb;
-        --color-text-muted: #9ca3af;
-        --color-text-secondary: #6b7280;
-        --color-border: #374151;
-        --color-border-light: #1f2937;
-        --color-neutral-light: #1f2937;
-        --color-primary-light: #1e3a5f;
-        --color-success-light: #064e3b;
-        --color-warning-light: #78350f;
-        --color-danger-light: #7f1d1d;
-    }
-    [data-testid="stSidebar"] { background: #1a1a2e; }
-    </style>
-    """, unsafe_allow_html=True)
-
 # ── Branded Header ────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="header-bar">
@@ -194,26 +178,287 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session State ─────────────────────────────────────────────────────────────
-if 'messages' not in st.session_state:
+if "messages" not in st.session_state:
     st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if "in_session_dataset" not in st.session_state:
+    st.session_state.in_session_dataset = None
+if "consolidation_id" not in st.session_state:
+    st.session_state.consolidation_id = None
+if "generated_doc_bytes" not in st.session_state:
+    st.session_state.generated_doc_bytes = None
+
+# Fresh (cheap) SQLite connection every rerun — Streamlit reruns the whole
+# script on every interaction, and caching this in session_state risks
+# cross-rerun/thread issues with a long-lived sqlite3 connection.
+try:
+    store = ConsolidationStore()
+except Exception as e:
+    st.error(f"Could not open the local consolidation database: {e}")
+    st.stop()
+
+PERIOD_OPTIONS = ["6mo", "1yr", "2yr", "3yr"]
+
+RESOLUTION_CONFIDENCE_BADGE = {
+    "EXACT": "badge-success",
+    "FUZZY": "badge-warning",
+    "PARTIAL": "badge-warning",
+}
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### New Consolidation")
+    drug_name_input = st.text_input("Drug name", key="drug_name_input")
+    period_input = st.selectbox("Reporting period", PERIOD_OPTIONS, key="period_input")
+
+    if st.button("Run Consolidation", use_container_width=True):
+        if not drug_name_input or not drug_name_input.strip():
+            st.warning("Enter a drug name before running a consolidation.")
+        else:
+            try:
+                with st.spinner(f"Consolidating {drug_name_input.strip()} ({period_input})..."):
+                    result = consolidate_psur(drug_name_input.strip(), period_input)
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+            else:
+                if isinstance(result, ConsolidationResult):
+                    st.session_state.in_session_dataset = result
+                    st.session_state.generated_doc_bytes = None
+                    st.session_state.consolidation_id = None
+                    try:
+                        cid = store.save_consolidation(result)
+                    except Exception as e:
+                        st.error(f"Consolidation succeeded but saving it failed: {e}")
+                    else:
+                        st.session_state.consolidation_id = cid
+                        st.rerun()
+                elif isinstance(result, ConsolidationError):
+                    if result.stage == "CLIENT_CONSTRUCTION":
+                        st.error(
+                            f"Configuration issue: {result.message} — "
+                            "check that API keys are set."
+                        )
+                    elif result.stage == "IDENTITY_RESOLUTION":
+                        st.error(
+                            f"Could not resolve '{drug_name_input.strip()}': {result.message} — "
+                            "check the spelling or try a different name."
+                        )
+                    elif result.stage == "RETRIEVAL":
+                        st.error(
+                            f"Data retrieval failed: {result.message} — you can try again."
+                        )
+                    else:
+                        st.error(f"Consolidation failed ({result.stage}): {result.message}")
+                else:
+                    st.error("Unexpected response from consolidation pipeline.")
+
+    st.markdown("---")
+    st.markdown("### Prior Sessions")
+    try:
+        prior_sessions = store.list_consolidations()
+    except Exception as e:
+        prior_sessions = []
+        st.error(f"Could not load prior sessions: {e}")
+
+    if prior_sessions:
+        labels = [
+            f"{entry['canonical_name']} — {entry['period']} — {entry['created_at']}"
+            for entry in prior_sessions
+        ]
+        selected_idx = st.selectbox(
+            "Select a prior consolidation",
+            range(len(prior_sessions)),
+            format_func=lambda i: labels[i],
+            key="prior_session_idx",
+        )
+        if st.button("Load Selected", use_container_width=True):
+            selected_id = prior_sessions[selected_idx]["id"]
+            try:
+                loaded = store.load_consolidation(selected_id)
+            except Exception as e:
+                st.error(f"Unexpected error loading consolidation: {e}")
+            else:
+                if loaded is not None:
+                    st.session_state.in_session_dataset = loaded
+                    st.session_state.consolidation_id = selected_id
+                    st.session_state.generated_doc_bytes = None
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": (
+                            f"Loaded prior consolidation for "
+                            f"{loaded.drug_identity.canonical_name} ({loaded.period})."
+                        ),
+                    })
+                    st.rerun()
+                else:
+                    st.error("Could not find that consolidation — it may have been removed.")
+    else:
+        st.caption("No prior consolidations saved yet.")
+
+
+# ── Main Area ──────────────────────────────────────────────────────────────────
+dataset = st.session_state.in_session_dataset
+
+if dataset is not None:
+    identity = dataset.drug_identity
+
+    # ── Identity Resolution Feedback Card ──────────────────────────────────
+    confidence_badge = RESOLUTION_CONFIDENCE_BADGE.get(
+        identity.resolution_confidence, "badge-neutral"
+    )
+    mad_display = (
+        identity.market_authorization_date.isoformat()
+        if identity.market_authorization_date
+        else "OTC — no market authorization date on file"
+    )
+    st.markdown(f"""
+    <div class="card card-accent-primary">
+        <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
+            <span style="font-weight:700; font-size:var(--text-lg);">{html.escape(identity.canonical_name)}</span>
+            <span class="badge {confidence_badge}">{html.escape(identity.resolution_confidence)}</span>
+        </div>
+        <div style="color:var(--color-text-muted); font-size:var(--text-sm); line-height:1.6;">
+            <strong>Brand names:</strong> {html.escape(", ".join(identity.brand_names)) or "—"}<br/>
+            <strong>Generic names:</strong> {html.escape(", ".join(identity.generic_names)) or "—"}<br/>
+            <strong>Market authorization date:</strong> {html.escape(mad_display)}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Data Completeness Card (Guardrail 5) ───────────────────────────────
+    retrieval = dataset.retrieval
+    dedup = dataset.dedup
+    truncated_chunks = [c.label for c in retrieval.chunks if c.truncated]
+
+    truncated_html = (
+        f"<div style='color:var(--color-danger); font-size:var(--text-sm); margin-top:0.4rem;'>"
+        f"<strong>Truncated chunks:</strong> {html.escape(', '.join(truncated_chunks))}</div>"
+        if truncated_chunks else
+        "<div style='color:var(--color-success); font-size:var(--text-sm); margin-top:0.4rem;'>"
+        "No chunks truncated — full period coverage retrieved.</div>"
+    )
+
+    st.markdown(f"""
+    <div class="card">
+        <div style="font-weight:700; margin-bottom:0.5rem;">Data Completeness &amp; Methodology</div>
+        <div style="font-size:var(--text-sm); line-height:1.7;">
+            <strong>Reports retrieved:</strong> {retrieval.total_retrieved_count} of an estimated
+            {retrieval.total_estimated_count} total<br/>
+            <strong>Period:</strong> {retrieval.period_start} to {retrieval.period_end}
+            ({"fallback anchor: " + (retrieval.fallback_reason or "unknown") if retrieval.used_fallback_anchor else "anchored to market authorization date"})<br/>
+            <strong>Deduplication:</strong> {dedup.total_input_count} input reports →
+            {dedup.total_output_count} unique
+            (removed {dedup.removed_by_exact_id} by exact ID match,
+            {dedup.removed_by_heuristic} by heuristic match)
+        </div>
+        {truncated_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Ranked Signal Table ─────────────────────────────────────────────────
+    st.markdown("#### Ranked Signals")
+    top_signals = dataset.ranking.ranked_signals[:TOP_N_NARRATED_SIGNALS]
+    table_rows = [
+        {
+            "Rank": s.rank,
+            "Symptom": s.symptom,
+            "Seriousness": s.seriousness_tier,
+            "Strength of Evidence": s.strength_of_evidence_tier,
+            "Reversibility": s.reversibility_tier,
+            "Public Health Impact": s.public_health_tier,
+            "Report Count": s.report_count,
+        }
+        for s in top_signals
+    ]
+    if table_rows:
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No ranked signals available for this consolidation.")
+    st.caption(
+        f"Showing top {len(table_rows)} of {dataset.ranking.total_signals} signals — "
+        "full ranked list is included in the exported PSUR document."
+    )
+
+    # ── Document Generation ─────────────────────────────────────────────────
+    st.markdown("#### Export")
+    if st.button("Generate PSUR Document"):
+        try:
+            with st.spinner("Generating document..."):
+                doc = generate_psur_document(dataset)
+                buf = io.BytesIO()
+                doc.save(buf)
+                buf.seek(0)
+                st.session_state.generated_doc_bytes = buf.getvalue()
+        except Exception as e:
+            st.error(f"Unexpected error generating document: {e}")
+
+    if st.session_state.generated_doc_bytes is not None:
+        st.download_button(
+            "Download .docx",
+            data=st.session_state.generated_doc_bytes,
+            file_name=f"PSUR_{identity.canonical_name}_{dataset.period}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    st.markdown("---")
+else:
+    st.info(
+        "Run a consolidation from the sidebar (or load a prior session) to view "
+        "identity resolution, data completeness, and ranked signals."
+    )
 
 # ── Chat History Display ──────────────────────────────────────────────────────
 for message in st.session_state.messages:
-    with st.chat_message(message['role']):
-        st.markdown(message['content'])
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-# ── Execution Loop (placeholder pending Phase 8 agent rebuild) ────────────────
-if prompt := st.chat_input('Analyze a drug safety profile....'):
-    st.session_state.messages.append({'role': 'user', 'content': prompt})
-    with st.chat_message('user'):
+# ── Chat Interface ──────────────────────────────────────────────────────────
+if prompt := st.chat_input("Ask about this drug's safety profile..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.chat_message('assistant'):
-        if agent_executor is None:
-            placeholder_response = (
-                "The PSUR consolidation agent is being rebuilt "
-                "(see docs/PSUR_CONSOLIDATION_SCOPE.md, Phase 8). "
-                "This chat is a placeholder until the new agent orchestration lands."
+    with st.chat_message("assistant"):
+        history = st.session_state.messages[:-1]
+        try:
+            with st.spinner("Thinking..."):
+                turn_result = run_agent_turn(
+                    conversation_history=history,
+                    user_message=prompt,
+                    in_session_dataset=st.session_state.in_session_dataset,
+                )
+        except Exception as e:
+            error_text = f"Unexpected error: {e}"
+            st.error(error_text)
+            st.session_state.messages.append({"role": "assistant", "content": error_text})
+        else:
+            st.markdown(turn_result.response_text)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": turn_result.response_text}
             )
-            st.info(placeholder_response)
-            st.session_state.messages.append({'role': 'assistant', 'content': placeholder_response})
+
+            try:
+                store.save_message(
+                    st.session_state.session_id, "user", prompt, st.session_state.consolidation_id
+                )
+                store.save_message(
+                    st.session_state.session_id,
+                    "assistant",
+                    turn_result.response_text,
+                    st.session_state.consolidation_id,
+                )
+            except Exception as e:
+                st.error(f"Response generated, but saving chat history failed: {e}")
+
+            if turn_result.dataset_changed:
+                st.session_state.in_session_dataset = turn_result.updated_dataset
+                st.session_state.generated_doc_bytes = None
+                try:
+                    new_cid = store.save_consolidation(turn_result.updated_dataset)
+                except Exception as e:
+                    st.error(f"New dataset generated, but saving it failed: {e}")
+                else:
+                    st.session_state.consolidation_id = new_cid
+                    st.rerun()

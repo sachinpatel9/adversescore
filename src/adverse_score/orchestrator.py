@@ -88,9 +88,9 @@ tool; if their requested timeframe doesn't map cleanly onto one of the four, ask
 them to pick one of "6mo", "1yr", "2yr", or "3yr" instead of guessing.
 
 NARRATION CAP: When discussing ranked signals in conversation, limit detail to at \
-most the top {top_n} signals. The full ranked list is not exportable yet in this \
-phase of the product - do not reference document, PDF, or DOCX export \
-capabilities.
+most the top {top_n} signals. The full, uncapped ranked list is available in the \
+exported PSUR .docx document (generated separately via the UI's export control) - \
+you may tell the user this, but you do not generate or attach documents yourself.
 
 Always be precise about what the data does and does not show, and never overstate \
 certainty.""".format(top_n=TOP_N_NARRATED_SIGNALS)
