@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AdverseScore is a clinical decision support agent that scores pharmaceutical safety signals using FDA adverse event data. It combines an openFDA API client, a statistical scoring engine, and a LangGraph-orchestrated GPT-4o agent behind a Streamlit chat UI.
+AdverseScore is being rebuilt as a **PSUR consolidation agent** for pharmacovigilance teams. Given a drug name and reporting period, it consolidates FAERS adverse event data, deduplicates case reports, ranks signals deterministically, and generates structured `.docx` documents aligned to ICH E2C(R2) PBRER format. The rebuild is tracked in the authoritative scope document `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Currently completed:** Phase 0 (Foundation Cleanup) and Phase 1 (Drug Identity Resolution). Phases 2–11 (chunked retrieval, deduplication, ranking engine, document generation, new UI, agent orchestration) are in progress.
 
 ## Running the Application
 
@@ -20,23 +20,18 @@ Requires a `.env` file with `OPENFDA_API_KEY` and `OPENAI_API_KEY` (see `.env.ex
 
 ## Architecture
 
-The execution flow is: **Streamlit UI → LangGraph agent → Pydantic validation → AdverseScoreClient → openFDA API → scoring math → JSON payload → LLM response**.
+Current state (Phase 0 + Phase 1 complete): Foundation cleanup and drug identity resolution are done. Phase 2+ modules (consolidation, ranking, document generation, new agent orchestration) are planned but not yet built.
 
-- **`app.py`** — Streamlit chat interface. Passes full conversation history to the agent for multi-turn support. Sets `recursion_limit=10` to prevent runaway agent loops.
-- **`src/adverse_score/orchestrator.py`** — Wires the LangGraph react agent: GPT-4o (temperature=0.2), system prompt with safety protocols (SCOPE ENFORCEMENT, DIAGNOSIS LOCK, TOOL PROTOCOL), single tool binding.
-- **`src/adverse_score/agent_tools.py`** — Defines `ClinicalQuerySchema` (Pydantic v2, `extra="forbid"`) and the `@tool`-decorated `get_adverse_score` function. The schema enforces strict types: `Literal["M","F"]` for sex, `ge=1,le=120` for age, `min_length=1` on drug/symptom strings.
-- **`src/adverse_score/client.py`** — Thin orchestrator (~180 lines). Coordinates data retrieval from `FDAClient` with scoring math from the pure modules. Exposes `AdverseScoreClient` with delegation one-liners for backward compatibility. Orchestration methods: `calculate_final_score`, `_calculate_prr_metrics`, `get_peer_benchmark`, `fetch_quarterly_data`, `compute_trend`.
-- **`src/adverse_score/fda_client.py`** — `FDAClient` class (~300 lines). All openFDA HTTP calls: `fetch_events`, `fetch_label_text`, `_discover_drug_class`, `_discover_peers`, `_fetch_symptom_counts`, `build_query`, `_flatten_results`, `_compute_quarter_boundaries`. Owns the `requests.Session` with dual-layer retry: urllib3 `Retry` for transport-level status codes (429/5xx) and tenacity `_resilient_get` for application-level transient failures with exponential backoff.
-- **`src/adverse_score/scoring.py`** — Pure scoring math (~200 lines). `SEVERITY_WEIGHTS`, `calculate_report_score`, `calculate_confidence`, `generate_guardrails`, `calculate_final_score`. No HTTP calls — receives all data as parameters.
-  - **Severity weights**: Defined in `config.py` as `SEVERITY_WEIGHT_*`. DEATH=1.75, HOSPITALIZATION=1.0, OTHER_SERIOUS=0.75, NON_SERIOUS=0.25
-  - **Label penalty**: Defined in `config.py` as `LABEL_PENALTY_*`. Unlabeled+Serious=2.0x, Unlabeled+Non-Serious=1.5x, Labeled=1.0x
-  - **Recency decay**: Exponential with `RECENCY_HALF_LIFE_DAYS`=90: `exp(RECENCY_DECAY_CONSTANT * days / 90)`. Returns 1.0 at day 0, 0.5 at 90 days, 0.25 at 180 days.
-  - **Score formula**: `min(100, mean(base_weight * label_penalty * decay) * SCORE_SCALAR)`
-  - **Benchmarking**: Discovers pharmacologic class via FDA count endpoint, finds top `MAX_PEERS` peers, averages their scores
-- **`src/adverse_score/prr.py`** — Pure PRR + Wald 95% CI math (~70 lines). `calculate_prr(drug_counts, class_counts, target_symptom, label_text)`. Signal if CI lower bound > 1.0 and drug cases >= 3.
-- **`src/adverse_score/label_classifier.py`** — Pure label classification (~30 lines). `calculate_label_penalty` and `classify_label_status`. Zero dependencies beyond stdlib.
-- **`src/adverse_score/logger.py`** — JSON-structured logging to stderr (~20 lines). `get_logger(name)` and `log_event(logger, event, **kwargs)`. All modules use this instead of `print()`.
-- **`src/adverse_score/config.py`** — Loads `.env`, validates both API keys are present (fail-fast). Also defines all named constants for the scoring engine: severity weights, label penalties, confidence curve parameters, guardrail thresholds, PRR constants, API timeouts, and retry configuration. Each constant has an inline comment explaining the clinical rationale.
+- **`app.py`** — Streamlit UI. Currently a placeholder chat interface (shows "PSUR consolidation agent is being rebuilt" message instead of invoking a live agent). Will be rebuilt in Phases 8–10 to display PSUR period selector, ranked signal list, and `.docx` export controls.
+- **`src/adverse_score/drug_identity.py`** (NEW, Phase 1) — Given a raw drug name, resolves it to canonical brand/generic name variants and market authorization/approval date. Entry point: `resolve_drug_identity(raw_name: str, client: Optional[FDAClient] = None)`. Uses openFDA label/NDC queries (exact then broadened) followed by `drugsfda.json` for approval date lookup. Returns `DrugIdentity` dataclass (with resolution_confidence) or `DrugIdentityError` on failure. Known limitation: OTC monograph drugs (aspirin, ibuprofen) have no `drugsfda.json` entry, so approval_date is `None` (marked `PARTIAL` confidence, not an error).
+- **`src/adverse_score/client.py`** — Much-reduced orchestrator. Removed: `calculate_final_score`, `get_peer_benchmark`, `fetch_quarterly_data`, `compute_trend`, all scoring-related methods. Retained: FDA delegation one-liners (`fetch_events`, `fetch_label_text`, `build_query`, etc.), `_classify_label_status`, `_calculate_prr_metrics`. No longer requires API keys at construction time (backward-compatible skeleton pattern).
+- **`src/adverse_score/fda_client.py`** — openFDA HTTP client (~300 lines). Methods: `fetch_events`, `fetch_label_text`, `_discover_drug_class`, `_discover_peers`, `_fetch_symptom_counts`, `build_query`, `_flatten_results`, `_compute_quarter_boundaries`. Dual-layer retry (urllib3 for transport codes, tenacity for app-level transience). Phase 2 will modify this for chunked/paginated retrieval.
+- **`src/adverse_score/prr.py`** — Pure PRR + Wald 95% CI math (~70 lines). `calculate_prr(drug_counts, class_counts, target_symptom, label_text)`. Unchanged; will feed Phase 3+ ranking engine.
+- **`src/adverse_score/label_classifier.py`** — Pure label classification (~30 lines). Now contains only `classify_label_status` (LABELED/UNLABELED/LABEL_STATUS_UNKNOWN). Removed: `calculate_label_penalty` (was old scoring logic, not needed for new ranking).
+- **`src/adverse_score/orchestrator.py`** — Placeholder. `agent_executor = None` sentinel; importing no longer requires API keys. Will be rebuilt in Phase 8 with new LangGraph agent, multi-turn guidance, and 7-guardrail system prompt.
+- **`src/adverse_score/persistence.py`** — Reduced to bare skeleton: `__init__`, no-op `_init_schema`, context-manager protocol. Old `AnalysisStore.analyses` table and CRUD methods removed. Phase 7 will design new schema for consolidated datasets + conversation history.
+- **`src/adverse_score/logger.py`** — JSON-structured logging to stderr. Unchanged.
+- **`src/adverse_score/config.py`** — Removed 26 old composite-score constants (severity weights, label penalties, recency decay, confidence curve, guardrail thresholds, etc.). Retained: `initialize_config()`, PRR constants, API timeout/retry constants, drug-class/peer-discovery constants. Added Phase 1 constants: `DRUGSFDA_ENDPOINT`, `NDC_ENDPOINT`, `DRUG_IDENTITY_*_LIMIT`, `DRUGSFDA_APPROVED_STATUS`.
 
 ## Workflow Multi-Agent Orchestration 
 
@@ -61,34 +56,48 @@ NOTE: The goal of the Multi-Agent Orchestration is to optimize token usage so ea
 
 - All query-building methods must call `_sanitize_for_query()` before embedding values in Lucene strings. This is a security invariant — check it when adding new FDA queries.
 - openFDA sex codes: **1=Male, 2=Female**. This was previously inverted and is a common source of bugs.
-- The agent's error payload must include `clinical_disclaimer`, `diagnosis_lock`, `requires_human_review`, and `system_directive` — the system prompt rules depend on these fields being present in all payloads. The raw exception message must **never** appear in the payload; log it server-side via `log_event()` only.
-- Peers with zero adverse event data are excluded from benchmark averages to prevent artificial score deflation.
 - A pre-commit hook in `.git/hooks/pre-commit` blocks `.env` files and scans for API key patterns.
-- **`AnalysisStore` (persistence.py)** supports the context manager protocol — prefer `with AnalysisStore() as store:` over manual `.close()` to guarantee connection cleanup on exceptions. `save_analysis` uses `.get()` for optional fields (`label_status`, `class_benchmark_avg`) and is safe to call on Incomplete Data payloads. `get_history` orders by `id DESC` (insertion order) so the most recently saved row is always first regardless of the timestamp value stored.
-- **URL encoding in `fda_client.py`**: `_discover_drug_class` and `_fetch_label_class_fallback` pass query parameters via `params=` dict to `session.get()` — do not use `urllib.parse.quote` manually. The `requests` library handles encoding. Drug/class names are still routed through `_sanitize_for_query()` before being embedded in Lucene field strings.
-- **Module split pattern**: `client.py` is a thin orchestrator that composes `FDAClient` and delegates to pure modules (`scoring.py`, `prr.py`, `label_classifier.py`). All methods on `AdverseScoreClient` are preserved as delegation one-liners for backward compat — tests, `agent_tools.py`, and `app.py` call `client.method()` without changes. `self.session = self.fda.session` ensures monkeypatch targets still work.
-- **`_calculate_prr_metrics`** accepts optional `start_date` and `end_date` parameters and passes them through to `_fetch_symptom_counts`. Use these when computing time-bounded PRR (e.g. per-quarter temporal analysis).
-- **Narrative drug name attribution** in `app.py`: after the agent returns, `st.session_state["last_analyzed_drug"]` is populated from the tool's JSON payload (`clinical_signal.drug_target`). The narrative save block uses this key — do not re-query `get_history(limit=1)` as that is a race condition in concurrent sessions.
-- **`build_query` type hints**: `patient_age`, `patient_sex`, `start_date`, and `end_date` are all typed as `Optional[...]` — do not use bare `int = None` or `str = None` which suppress type checking.
+- **URL encoding in `fda_client.py`**: Query parameters must be passed via the `params=` dict to `session.get()`. Do NOT use `urllib.parse.quote()` manually — the `requests` library handles encoding. Critically: when composing multi-term Lucene queries with "OR"/"AND" keywords, use literal spaces (e.g., `"KEYTRUDA OR OPDIVO"`) in the param value; using literal "+OR+" text gets double-encoded to `%2B` by `requests`, breaking the query server-side. Drug/class names themselves are still routed through `_sanitize_for_query()` before being embedded in Lucene field strings.
+- **`_calculate_prr_metrics`** accepts optional `start_date` and `end_date` parameters for time-bounded PRR calculation. Pass these through to `_fetch_symptom_counts` when computing per-quarter or per-period analysis.
 - **Dual-layer HTTP retry**: `fda_client.py` uses urllib3 `Retry` for transport-level status code retries (429/5xx) and tenacity `_resilient_get()` for application-level transient failure retries with exponential backoff. The tenacity decorator uses `reraise=True` so the original exception propagates to each method's try/except handler after retries exhaust. Tests mock `client.session.get` and the retry logic is exercised transparently.
-- **Config constants**: All tunable numbers (severity weights, label penalties, confidence curve parameters, guardrail thresholds, PRR constants, API timeouts, retry config) are defined in `config.py` with named constants and clinical rationale comments. Modules import them — do not hardcode numeric values in scoring/PRR/FDA modules.
+- **Config constants**: All tunable numbers (PRR constants, API timeouts, retry config, drug-class/peer-discovery limits, Phase 1 drug identity API limits) are defined in `config.py` with named constants and clinical rationale comments. Modules import them — do not hardcode numeric values in FDA/PRR modules.
+- **OTC Monograph Drugs Have No `drugsfda.json` Entry**: When resolving a drug identity, OTC monograph drugs (e.g., aspirin, ibuprofen) do not appear in `drug/drugsfda.json` because they are approved via a monograph pathway, not an NDA/ANDA/BLA. The resolution will succeed (finding brand/generic names) but `market_authorization_date` will be `None`, and `resolution_confidence` will be `PARTIAL`. This is correct behavior, not an error; document it when generating PSUR export.
+- **Drug Identity Resolution Limitation**: When a drug name matches multiple NDAs/ANDAs/BLAs, the earliest `submission_status_date` across all matched applications with `submission_status="AP"` is used as the market_authorization_date. This can conflate different products with the same brand name (e.g., different dosage forms approved at different times). For canonical identity, prefer exact NDA/ANDA/BLA number over inferring from bulk name resolution.
 
 ## Test Suite
 
-The project has two test files:
+Tests are organized under `tests/` directory, split by module (mirroring `src/adverse_score/` structure):
 
-- **`test_adversescore.py`** — 158 unit tests covering Pydantic validation, query building, scoring math, PRR calculation, confidence metrics, guardrails, persistence, system prompt structure, narrative/temporal/delta protocols, and agent tool behavior. PRR tests call `calculate_prr()` directly with pre-computed count dicts (no mocking). All tests use mocks — no API keys required. Runs in ~3 seconds.
-- **`test_e2e.py`** — 35 end-to-end integration tests hitting the live openFDA API and OpenAI LLM. Covers FDA API contract validation, full pipeline scoring, agent tool invocation, LLM response quality (prose format, disclaimer, scope enforcement), persistence, security regression, and performance benchmarks. Requires API keys in `.env`; tests skip gracefully when keys are absent.
+```
+tests/
+├── conftest.py                   # Pytest fixtures (all tests)
+├── unit/
+│   ├── test_fda_client.py        # FDAClient methods, query building, retry logic
+│   ├── test_prr.py               # PRR + Wald 95% CI calculation
+│   ├── test_label_classifier.py  # Label classification
+│   ├── test_persistence.py       # AnalysisStore (currently skeleton)
+│   ├── test_orchestrator.py      # orchestrator.py placeholder validation
+│   ├── test_agent_tools.py       # agent_tools.py placeholder validation
+│   └── test_drug_identity.py     # drug_identity.py resolution, error handling (NEW, Phase 1)
+└── e2e/
+    ├── test_fda_client_e2e.py     # Live openFDA API contract validation
+    ├── test_prr_e2e.py            # PRR against live FAERS data
+    └── test_drug_identity_e2e.py  # Drug identity resolution against live API (NEW, Phase 1)
+```
+
+**Current counts:** 58 unit tests (all passing, no API keys, ~16s), 13 E2E tests (12 passing against live openFDA; 1 unrelated flaky timing test occasionally exceeds 10s threshold due to live API latency — pre-existing, not a regression).
+
+Configuration: `pytest.ini` specifies `pythonpath = src tests` (space-separated, not comma-separated — comma breaks pytest) and `testpaths = tests`.
 
 ```bash
 # Unit tests only (fast, no API keys)
-python -m pytest test_adversescore.py -v
+pytest tests/unit -v
 
 # E2E integration tests (requires .env)
-python -m pytest test_e2e.py -v -m e2e
+pytest tests/e2e -v -m e2e
 
-# Full suite
-python -m pytest -v
+# Full suite (from repo root)
+pytest -v
 ```
 
-For quick syntax validation without running full tests: `python -c "import ast; ast.parse(open('file').read())"`
+Old root-level `test_adversescore.py`, `test_e2e.py`, `conftest.py` are deleted; content redistributed into new structure.
