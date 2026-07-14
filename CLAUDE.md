@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AdverseScore is being rebuilt as a **PSUR consolidation agent** for pharmacovigilance teams. Given a drug name and reporting period, it consolidates FAERS adverse event data, deduplicates case reports, ranks signals deterministically, and generates structured `.docx` documents aligned to ICH E2C(R2) PBRER format. The rebuild is tracked in the authoritative scope document `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Currently completed:** Phase 0 (Foundation Cleanup), Phase 1 (Drug Identity Resolution), Phase 2 (Chunked, Paginated FDA Retrieval), Phase 3 (Deduplication), Phase 4 (Label Status Classification), and Phase 5 (Deterministic Ranking Engine). Phases 6–11 (document generation, new UI, agent orchestration) are in progress.
+AdverseScore is being rebuilt as a **PSUR consolidation agent** for pharmacovigilance teams. Given a drug name and reporting period, it consolidates FAERS adverse event data, deduplicates case reports, ranks signals deterministically, and generates structured `.docx` documents aligned to ICH E2C(R2) PBRER format. The rebuild is tracked in the authoritative scope document `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Currently completed:** Phase 0 (Foundation Cleanup), Phase 1 (Drug Identity Resolution), Phase 2 (Chunked, Paginated FDA Retrieval), Phase 3 (Deduplication), Phase 4 (Label Status Classification), Phase 5 (Deterministic Ranking Engine), and Phase 6 (Consolidation Orchestration). Phases 7–11 (document generation, new UI, agent orchestration) are in progress.
 
 ## Running the Application
 
@@ -20,7 +20,7 @@ Requires a `.env` file with `OPENFDA_API_KEY` and `OPENAI_API_KEY` (see `.env.ex
 
 ## Architecture
 
-Current state (Phase 0–5 complete): Foundation cleanup, drug identity resolution, chunked FDA retrieval, deduplication, label status classification, and deterministic ranking engine are done. Phase 6+ modules (document generation, new agent orchestration) are planned but not yet built.
+Current state (Phase 0–6 complete): Foundation cleanup, drug identity resolution, chunked FDA retrieval, deduplication, label status classification, deterministic ranking engine, and consolidation orchestration are done. Phase 7+ modules (document generation, new agent orchestration) are planned but not yet built.
 
 - **`app.py`** — Streamlit UI. Currently a placeholder chat interface (shows "PSUR consolidation agent is being rebuilt" message instead of invoking a live agent). Will be rebuilt in Phases 8–10 to display PSUR period selector, ranked signal list, and `.docx` export controls.
 - **`src/adverse_score/drug_identity.py`** (NEW, Phase 1) — Given a raw drug name, resolves it to canonical brand/generic name variants and market authorization/approval date. Entry point: `resolve_drug_identity(raw_name: str, client: Optional[FDAClient] = None)`. Uses openFDA label/NDC queries (exact then broadened) followed by `drugsfda.json` for approval date lookup. Returns `DrugIdentity` dataclass (with resolution_confidence) or `DrugIdentityError` on failure. Known limitation: OTC monograph drugs (aspirin, ibuprofen) have no `drugsfda.json` entry, so approval_date is `None` (marked `PARTIAL` confidence, not an error).
@@ -28,6 +28,7 @@ Current state (Phase 0–5 complete): Foundation cleanup, drug identity resoluti
 - **`src/adverse_score/fda_client.py`** — openFDA HTTP client (~500 lines). Existing methods: `fetch_events`, `fetch_label_text`, `_discover_drug_class`, `_discover_peers`, `_fetch_symptom_counts`, `build_query`, `_flatten_results`, `_compute_quarter_boundaries`. Dual-layer retry (urllib3 for transport codes, tenacity for app-level transience). Phase 2 additions: module-level pure functions `_add_months()` (stdlib day-of-month clamping), `compute_psur_period()` (anchors PSUR cycle to market_authorization_date, selecting most recently completed fixed-length cycle; falls back to rolling lookback for OTC or pre-approval drugs), `_compute_psur_chunks()` (slices PSUR period into quarterly chunks with labels `"chunk-{i}-YYYYMMDD-to-YYYYMMDD"`), `_merge_chunks()` (first-seen-wins dedup on report_id for boundary collisions). New `FDAClient` methods: `_build_psur_chunk_query()` (composes OR'd drug name variants + AND'd date range via params dict), `_fetch_chunk_paginated()` (paginates single chunk with skip/limit capped at `PSUR_SKIP_CEILING=25000`; aborts on per-chunk error without failing other chunks). New public method: `fetch_psur_reports()` (top-level entry point orchestrating all of the above; returns `PSURRetrievalResult` never raises except ValueError for empty name_variants list). Two new frozen dataclasses: `ChunkResult` (per-chunk metadata: label, dates, reports, counts, truncated flag, optional error) and `PSURRetrievalResult` (aggregate: period bounds, all chunks, merged reports, totals, completeness flags). Layering note: does NOT import `drug_identity.py` (avoids circular import); accepts plain primitives (name variants list, optional date, period string) instead. Phase 3 additions: `_flatten_results()` now emits three new keys on each flattened report dict (`symptom_list` as a list of MedDRA PT terms, `drug_names` as a deduped list of medicinal product names, `safetyreportversion` as int), and `_merge_chunks()` is now version-aware (when same `report_id` recurs across chunks, higher `safetyreportversion` wins instead of blind first-seen-wins). Two new module-level helpers: `_extract_drug_names(report)`, `_parse_version(raw)`. Phase 5 additions: `_flatten_results()` now also extracts per-report `reactions` key (`[{"term": <MedDRA PT>, "outcome_code": <int 1-6 or None>}, ...]`) from raw FAERS `patient.reaction[].reactionoutcome` field via new `_parse_outcome_code(raw)` helper (never raises; returns `None` for missing/malformed/out-of-range values, enabling safe reversibility tiering for Phase 5 ranking).
 - **`src/adverse_score/deduplication.py`** (NEW, Phase 3) — Pure deduplication module (no HTTP, no `FDAClient` import), same architectural pattern as `prr.py`/`label_classifier.py`. Removes duplicate FAERS case reports from a flattened report list. Entry point: `deduplicate_reports(reports: list) -> DedupResult`. Two-pass implementation: (1) Exact `safetyreportid` match with version awareness (groups by `report_id`, keeps highest `safetyreportversion` per id; reports with missing/`None` `report_id` get unique synthetic keys and never collapse), (2) Fallback heuristic match on survivors only (two reports with different `report_ids` are duplicates only if their full normalized `drug_names` set AND full normalized `symptom_list` set AND `date` are ALL identical — deliberately strict to avoid over-merging). Reports with empty `drug_names` or empty `symptom_list` are excluded from heuristic matching. Returns `DedupResult` (frozen dataclass): `reports`, `total_input_count`, `total_output_count`, `removed_by_exact_id`, `removed_by_heuristic`, `audit_trail` (list of removal dicts). Known limitation: `date` here is `receivedate` (FDA receipt date), not a true adverse-event onset date—this is the same proxy used elsewhere in the codebase.
 - **`src/adverse_score/ranking.py`** (NEW, Phase 5) — Deterministic signal ranking engine (no HTTP, no `FDAClient` import), pure module importing only `dataclasses`, `.config`, `.prr`, `.label_classifier`, `.logger`. Entry point: `rank_signals(reports: list, class_counts: dict, label_text: str) -> RankingResult`. A "signal" is one unique MedDRA PT symptom across deduplicated reports. Ranks each signal across four lexicographically-ordered tiers: (1) **Seriousness & Outcome** — DEATH > HOSPITALIZATION > OTHER_SERIOUS > NON_SERIOUS (derived from existing `is_death`/`is_hospitalization`/`severity` fields), (2) **Strength of Evidence** — STRONG_UNLABELED > STRONG_LABELED > WEAK_UNLABELED > WEAK_LABELED > UNKNOWN_LABEL_STATUS (reuses `prr.py`'s `calculate_prr()` output; unlabeled outranks labeled at equivalent evidence strength per scope doc), (3) **Reversibility** — FATAL > POOR > REVERSIBLE > UNKNOWN (derived from newly-extracted per-reaction FAERS outcome codes via Phase 5 `fda_client.py` changes; UNKNOWN used when outcome data is absent, never silently assumed reversible), (4) **Public Health Impact** — HIGH > MODERATE > LOW (derived from report-volume thresholds: 100/20). Returns `RankedSignal` (frozen dataclass: `symptom`, `rank`, `seriousness_tier`, `strength_of_evidence_tier`, `reversibility_tier`, `public_health_tier`, `prr_metrics` dict, `report_count`) and `RankingResult` (frozen dataclass: `ranked_signals` list, `label_summary` as `LabelClassificationResult`, `formula_version` string, `total_signals` int). Sort key is purely internal (tuple of tier ordinals); never stored/exposed on output dataclasses — this design explicitly avoids the banned single composite score. Known limitation: reversibility is a heuristic approximation based on outcome codes; true clinical reversibility assessment requires expert review.
+- **`src/adverse_score/consolidation.py`** (NEW, Phase 6) — Single pipeline entry point wiring Phases 1–5 together into one coherent, callable PSUR consolidation workflow. Entry point: `consolidate_psur(drug_name: str, period: str, client: Optional[FDAClient] = None) -> Union[ConsolidationResult, ConsolidationError]`. Accepts optional `FDAClient` (dependency-injection pattern matching `drug_identity.py`); if none provided, constructs one (catching `EnvironmentError` → structured error). Pipeline: `resolve_drug_identity()` (Phase 1) → builds deduped `name_variants` from brand/generic/substance names → `fetch_psur_reports()` (Phase 2) → `deduplicate_reports()` (Phase 3) → `fetch_label_text()` + `_discover_drug_class()` + conditional `_fetch_symptom_counts()` (canonical_name only, no fallback loop; known limitation: generic-only drugs with no brand_names may get empty label lookup since `fetch_label_text` queries brand_name field specifically; degrades gracefully to LABEL_STATUS_UNKNOWN downstream, never crashes) → `rank_signals()` (Phase 5). Returns `ConsolidationResult` (frozen dataclass: `drug_identity`, `period`, `retrieval`, `dedup`, `ranking`, `pharm_class`, `class_counts_available` computed as `bool(class_counts)` not `bool(pharm_class)`, `formula_version` passthrough) or `ConsolidationError` (frozen dataclass: `drug_name`, `stage`, `reason`, `message`). Follows established "structured result, never raise for domain failures" convention. Empty report set after deduplication is NOT an error — produces valid `ConsolidationResult` with `ranking.total_signals == 0`. No new `config.py` constants added (pure wiring, no new tunable thresholds).
 - **`src/adverse_score/prr.py`** — Pure PRR + Wald 95% CI math (~70 lines). `calculate_prr(drug_counts, class_counts, target_symptom, label_text)`. Unchanged; will feed Phase 4+ ranking engine.
 - **`src/adverse_score/label_classifier.py`** — Pure label classification. Contains `classify_label_status(label_text: str, symptoms_str: str) -> str` (single symptom, LABELED/UNLABELED/LABEL_STATUS_UNKNOWN via substring match; unchanged from prior phases, used by prr.py) and NEW Phase 4: `classify_label_statuses(label_text: str, symptoms: list) -> LabelClassificationResult` (batch variant for Phase 5 ranking consumption). The batch function normalizes symptoms via `.strip().upper()`, dedupes case-insensitively, filters empty entries, sorts for determinism, and calls the existing single-symptom function once per unique symptom. Returns frozen dataclass `LabelClassificationResult` with per-symptom status dict, total/labeled/unlabeled/unknown counts. Invariant: `labeled_count + unlabeled_count + unknown_count == total_symptoms`.
 - **`src/adverse_score/orchestrator.py`** — Placeholder. `agent_executor = None` sentinel; importing no longer requires API keys. Will be rebuilt in Phase 8 with new LangGraph agent, multi-turn guidance, and 7-guardrail system prompt.
@@ -38,67 +39,264 @@ Current state (Phase 0–5 complete): Foundation cleanup, drug identity resoluti
 ## Workflow Multi-Agent Orchestration
 
 Each phase's implementation plan must declare a "Critical Files" list (files that may be
-created/modified) before any subagent is dispatched. All three subagents below operate
-strictly within that declared file boundary unless a subagent discovers a genuine
-cross-cutting bug — in which case it stops and reports back rather than silently expanding
-scope.
+created/modified) before any subagent is dispatched. All subagents below operate strictly
+within that declared file boundary unless a subagent discovers a genuine cross-cutting bug
+— in which case it stops and reports back (with file path, line number, and rationale)
+rather than silently expanding scope.
 
-**Dispatch mechanics:** All three subagents are dispatched via the `Agent` tool with
-`subagent_type: general-purpose` (or `claude`). Never dispatch them as `Explore` or `Plan`
-— those two agent types do not have Write/Edit tools and would silently break the full
-tool access every subagent below requires.
+**Dispatch mechanics:** Subagents are dispatched via the `Agent` tool with `subagent_type:
+general-purpose` (or `claude`). Never use `Explore` or `Plan` types — those lack Write/Edit
+tools. **Dispatch context optimization:** each subagent receives only phase-scoped context
+(phase plan + Critical Files + relevant design decisions), not full CLAUDE.md, to minimize
+token waste on repeated architecture overview.
 
-1. Orchestrator Agent 
-* Model: Fable 5 (OR Opus 4.8 when Fable 5 is no longer available due to usage limits)
-* Tool Access: Full tool access (Read, Write, Edit, Bash, etc)
-* Purpose: Plans and delegates to the SubAgent workers
+**Handoff protocol:** Each subagent produces a **structured summary** for the next subagent,
+following the templates below. This prevents re-stating facts and enforces clarity.
 
-2. Build SubAgent:
-* Model: Sonnet 5 (high effort)
-* Tool access: full tool access (Read, Write, Edit, Bash, etc.) — needed to write code and
-  run tests directly.
-* Scope: Implements the code + tests described in the phase's plan, touching only the files
-  in that phase's "Critical Files" list.
-* Out of scope: documentation files (CLAUDE.md, README.md), modules outside the declared
-  file list, and already-passing tests unrelated to the phase's own changes.
-* Produces: working code + a passing test suite for the declared scope, plus a concise
-  summary of what was built (function/class names, file paths) for the Review SubAgent.
+---
 
-3. Review SubAgent:
-* Model: attempt `model: sonnet` (Sonnet 5)
-* Tool access: full tool access (Read, Write, Edit, Bash, etc.) — needed to make direct
-  fixes to the code if bugs are identified.
-* Scope: Reviews only the diff produced by the Build SubAgent, against the originating
-  phase plan's acceptance criteria and test plan — not a general-purpose codebase audit.
-  Acts as a skeptical Staff Developer: checks correctness, security invariants
-  (`_sanitize_for_query()`, `params=` transport conventions), layering invariants, and test
-  coverage against the plan's stated test cases. Uses this repo's project-scoped
-  `staff-python-reviewer` skill (`.claude/skills/staff-python-reviewer/SKILL.md`), which
-  carries the same staff-level review persona as the global skill plus AdverseScore-specific
-  invariant checks.
-* Fixes bugs it finds directly, within the same file boundary the Build SubAgent used —
-  does not expand into unrelated refactors.
-* Out of scope: documentation files. Runs only after the Build SubAgent reports completion.
-* Produces: a short report of what was found/fixed, handed to the Write SubAgent.
+### Build SubAgent
 
-4. Write SubAgent:
-* Model: Haiku (Medium Effort)
-* Tool access: full tool access (Read, Write, Edit, Bash, etc.), though its scope below
-  only requires Read/Edit on CLAUDE.md and README.md.
-* Scope: Updates CLAUDE.md and README.md ONLY, using the Build/Review summary as its
-  factual source — never re-derives architecture independently and never touches code or
-  tests.
-* Runs only after the Review SubAgent confirms the phase's acceptance criteria are met
-  (tests green).
-* The documentation follows best industry practices: thorough in content, concise in
-  structure, professional in tone.
+* **Model:** Sonnet 5 (high effort)
+* **Tool access:** Read, Write, Edit, Bash — full access needed for code generation and testing
+* **Scope:** Implements code + tests per the phase plan, touching ONLY files in the Critical
+  Files list. No documentation files (CLAUDE.md, README.md). No pre-existing tests unrelated
+  to the phase's changes.
+* **Test execution:** Run tests ONLY for modified Critical Files:
+  ```bash
+  pytest tests/unit/test_<phase_module>.py tests/e2e/test_<phase_module>_e2e.py -v
+  ```
+  Do NOT run full test suite (`pytest -v`) — that introduces unrelated flakes and wastes tokens.
+* **Boundary validation:** Before committing, run `git status | grep modified` and verify EVERY
+  file is in the Critical Files list. If any file is outside the list, STOP and report the
+  boundary violation to the orchestrator with file path and rationale.
+* **Produces:** Structured handoff summary (see template below)
 
-NOTE: The goal of the Multi-Agent Orchestration is to optimize token usage and prevent
-scope creep or overlapping edits between subagents — each implementation plan should
-declare its Critical Files list explicitly so every subagent knows its boundary before
-starting. ALL tools are available for each subagent to use for any purposes necessary; the
-per-subagent "Tool access" lines above exist so file-boundary scope is never confused with
-tool-access restriction — they are independent constraints.
+**Build → Review Handoff Template:**
+```
+## Critical Files Modified
+- file_path: <path>, <lines_added>/<lines_modified>
+- (repeat for each file)
+
+## Test Results
+- Unit tests: N passed
+- E2E tests: M passed
+- Coverage: <module> at X%, <module> at Y%
+
+## Known Issues or Uncertainties
+(none) OR (list any, with rationale for leaving unresolved)
+
+## Notes for Reviewer
+(optional: edge cases manually tested, complex logic sections, assumptions made)
+```
+
+---
+
+### Review SubAgent
+
+* **Model:** Claude Sonnet 5 (must be explicit; if unavailable use Claude Opus 4.8)
+* **Tool access:** Read, Write, Edit, Bash — full access for deep analysis and direct code fixes
+* **Scope:** Reviews ONLY the diff produced by Build, against the phase plan's acceptance
+  criteria and test plan (not a general-purpose codebase audit). Checks:
+  - **Correctness:** Do the core algorithms work as designed? (hand-trace complex logic)
+  - **Security invariants:** `_sanitize_for_query()` on all FDA queries, `params=` dict usage,
+    no API keys hardcoded
+  - **Layering invariants:** Pure modules (dedup, ranking, label_classifier, prr) have no
+    HTTP imports; edge cases documented (None values, empty collections, missing fields)
+  - **Test coverage:** Do the tests cover the highest-risk acceptance criteria? (e.g.,
+    dedup over-merge guard, version-tiebreak correctness)
+* **Skill usage:** MUST invoke `staff-python-reviewer` skill (project-scoped version in
+  `.claude/skills/staff-python-reviewer/SKILL.md`) — do not review without it.
+* **Fixes:** Apply bugs found directly, within the same file boundary Build used. Do NOT
+  expand into unrelated refactors or touch documentation files.
+* **Runs:** Only after Build reports completion (via handoff summary).
+* **Produces:** Structured handoff summary (see template below)
+
+**Review → Auditor Handoff Template:**
+```
+## Review Findings
+- Bugs found and fixed: N (list with file:line if any)
+- Security/layering issues: (none) OR (list with severity)
+- Test coverage gaps: (none) OR (describe shortfall vs. acceptance criteria)
+
+## Acceptance Criteria Status
+- All criteria testable? YES / NO (if NO, explain which criteria and why)
+- Tests comprehensive? YES / NEEDS_CLARIFICATION / NO
+
+## Ready for Auditor?
+YES (proceed to acceptance audit) OR NO (specify issues to resolve)
+
+## Notes
+(optional: hand-traced logic, complex correctness reasoning, assumptions verified)
+```
+
+---
+
+### Acceptance Criteria Auditor (Fable)
+
+* **Model:** Fable 5
+* **Tool access:** Read ONLY (no Write, no Edit, no Bash) — this is a verification role, not
+  a modification role
+* **Scope:** Given the phase plan's acceptance criteria and Review's test results, verify
+  that each criterion is actually satisfied (not just that tests pass in isolation). Acts as
+  a skeptical requirements auditor: asks "did we really meet this criterion, or did we pass
+  the test on a technicality?"
+* **Method:** For each acceptance criterion:
+  1. Read the criterion from the phase plan
+  2. Read the corresponding test(s) and their results
+  3. Hand-trace the code path to verify it satisfies the criterion
+  4. Report: criterion met (YES) or unclear/unmet (NEEDS_REVIEW)
+  
+  **Example:** Criterion "heuristic dedup never merges partial symptom overlaps" + test
+  `test_partial_symptom_overlap_does_not_merge` PASSED + code review of heuristic matching
+  → conclusion: "Criterion met via frozenset equality check in dedup.py line X"
+
+* **Produces:** Structured handoff summary (see template below)
+
+**Auditor → Write Handoff Template:**
+```
+## Acceptance Criteria Audit Results
+(For each criterion in the phase plan:)
+- Criterion: "<text>"
+  Status: MET / UNMET / UNCLEAR
+  Evidence: (test name and result, hand-traced code path, or issue)
+
+## Overall Audit Result
+ALL CRITERIA MET ✓ (proceed to Write)
+OR
+CRITERIA X, Y REQUIRE REVIEW (send back to Review for clarification/fixes)
+
+## Edge Case Notes
+(optional: which acceptance criteria were highest-risk? Any that were barely met?)
+```
+
+---
+
+### Write SubAgent
+
+* **Model:** Haiku 4.5 (medium effort)
+* **Tool access:** Read, Edit ONLY — cannot Write to arbitrary files or run Bash. Permitted
+  files: CLAUDE.md, README.md, `docs/TODO.md` ONLY.
+* **Scope:** Updates CLAUDE.md, README.md, and `docs/TODO.md` using the Build/Review/Auditor
+  summary as its factual source. Never re-reads codebase, never re-derives architecture,
+  never makes inferences beyond what the handoff summary states. If ambiguity exists, ask for
+  clarification (via sendMessage to orchestrator or return summary with [NEEDS_CLARIFICATION]
+  tags) rather than guessing.
+* **Updates required:** Review's handoff specifies which CLAUDE.md sections change (e.g.,
+  "add deduplication.py bullet line 30", "update test counts to 99 unit, 16 E2E"). Write
+  makes those edits. README.md updates follow the existing pattern (add phase section,
+  mark roadmap item, update file tree, update test counts). `docs/TODO.md` updates flip the
+  completed phase's status marker from 🚧 to ✅, check off its Build/Tests items, and mark
+  the next phase 🚧 if immediately starting.
+* **Documentation quality:** Thorough in content, concise in structure, professional tone.
+  Follow the style of prior phases exactly.
+* **Runs:** Only after Auditor confirms all acceptance criteria are met.
+* **Produces:** Done (no handoff needed; docs are the output).
+
+---
+
+### Orchestration Flow (Phase Execution)
+
+```
+User approves phase plan (via ExitPlanMode)
+           ↓
+Dispatch Build SubAgent (Sonnet 5)
+  - Context: phase plan + Critical Files list + security invariants
+  - Task: implement code + tests for Critical Files only
+  - Timeout: ~30-60 min (depends on phase scope)
+           ↓
+Build completes → Handoff Summary
+           ↓
+Dispatch Review SubAgent (Sonnet 5)
+  - Context: Build summary + phase plan + acceptance criteria
+  - Task: deep review + fixes + staff-python-reviewer skill
+  - Prerequisite: MUST use skill (non-negotiable)
+  - Timeout: ~20-40 min
+           ↓
+Review green (tests pass) → Auditor Handoff Summary
+           ↓
+Dispatch Acceptance Criteria Auditor (Fable 5)
+  - Context: Auditor handoff + acceptance criteria + code paths
+  - Task: verify each criterion is actually met (not just tested)
+  - Read-only (no modifications)
+  - Timeout: ~10-15 min
+           ↓
+Auditor clears all criteria → Write Handoff Summary
+           ↓
+Dispatch Write SubAgent (Haiku 4.5)
+  - Context: Auditor summary + CLAUDE.md/README.md sections to update
+  - Task: update docs per handoff specification
+  - Timeout: ~5-10 min
+           ↓
+Write completes → Orchestrator spot-checks CLAUDE.md accuracy
+           ↓
+Commit ready (user decides: commit/push/iterate)
+```
+
+---
+
+### Token Optimization & Design Rationale
+
+**Why eliminate the Orchestrator Agent?** If the plan is pre-approved via ExitPlanMode,
+re-planning wastes ~50-100K tokens. Direct dispatch from the main Claude agent is faster
+and cheaper.
+
+**Why context-scoped handoffs?** Sending full CLAUDE.md to every agent (~160 lines per call)
+is ~40-50% token waste on repeated architecture overview. Each agent gets only what it
+needs.
+
+**Why restrict Build test scope?** Running `pytest -v` (all 99+ tests) every phase adds
+3-5 min and risk of unrelated test flakes. Running only tests for modified files keeps
+feedback tight and deterministic.
+
+**Why add an Auditor?** Review finds bugs; Auditor catches the "tests pass but acceptance
+spirit is missed" edge case. Risk-mitigation value justifies Fable's modest token cost.
+
+**Why Read-only for Auditor?** Verification role should not modify code. If Auditor finds
+an unmet criterion, it escalates back to Review (who has Write access) rather than trying
+to fix it itself.
+
+**Why Haiku for Write?** Docs updates are deterministic transformations (given facts from
+Build/Review, write the facts into CLAUDE.md). Haiku is cheap and sufficient. Restricting
+to Read/Edit on docs only removes accidental risk of overwriting code files.
+
+---
+
+### Critical Files Boundary Enforcement (Mandatory Checklist)
+
+Every subagent MUST verify file boundaries before committing:
+
+```
+## Critical Files Boundary Validation
+Before git commit:
+1. Run: git status | grep -E 'modified:|new file:'
+2. For EACH file, verify it's in the Critical Files list:
+   [ ] src/adverse_score/<module>.py
+   [ ] tests/unit/test_<module>.py
+   [ ] tests/e2e/test_<module>_e2e.py
+   (etc. — list all expected files)
+3. If ANY file is outside the list:
+   STOP → Report boundary violation (file path, rationale) to orchestrator
+   Do NOT commit.
+
+## Cross-Cutting Bug Escalation Protocol
+If a subagent discovers a genuine bug OUTSIDE the Critical Files list:
+1. Do NOT fix it (stays in scope boundary)
+2. Create a message to orchestrator with:
+   - File path and line number
+   - Bug description (why it breaks the phase)
+   - Why it's not in Critical Files
+   - Suggested fix (if obvious) or note "requires separate phase"
+3. Pause execution; await instruction
+```
+
+---
+
+**NOTE:** The goal of multi-agent orchestration is to optimize token usage and prevent
+scope creep or overlapping edits. Clear Critical Files boundaries, structured handoffs,
+and read-only verification roles (Auditor, Write) all enforce these constraints. All tools
+are available to each subagent as needed; the per-subagent "Tool access" lines define
+scope boundaries, not tool restrictions — these are independent constraints.
 
 
 
@@ -136,16 +334,18 @@ tests/
 │   ├── test_persistence.py       # AnalysisStore (currently skeleton)
 │   ├── test_orchestrator.py      # orchestrator.py placeholder validation
 │   ├── test_agent_tools.py       # agent_tools.py placeholder validation
-│   └── test_drug_identity.py     # drug_identity.py resolution, error handling (Phase 1)
+│   ├── test_drug_identity.py     # drug_identity.py resolution, error handling (Phase 1)
+│   └── test_consolidation.py     # consolidation.py pipeline wiring, error handling, end-to-end integration (Phase 6)
 └── e2e/
     ├── test_fda_client_e2e.py     # Live openFDA API contract validation
     ├── test_fda_client_psur_e2e.py # PSUR chunked retrieval against live API (Phase 2)
-    ├── test_deduplication_e2e.py  # Deduplication against live PSUR retrieval results (NEW, Phase 3)
+    ├── test_deduplication_e2e.py  # Deduplication against live PSUR retrieval results (Phase 3)
     ├── test_prr_e2e.py            # PRR against live FAERS data
-    └── test_drug_identity_e2e.py  # Drug identity resolution against live API (Phase 1)
+    ├── test_drug_identity_e2e.py  # Drug identity resolution against live API (Phase 1)
+    └── test_consolidation_e2e.py  # Full pipeline consolidation against live FDA data (Phase 6)
 ```
 
-**Current counts:** 138 unit tests (all passing, no API keys, ~24s), 16 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval and Phase 3 deduplication tests).
+**Current counts:** 147 unit tests (all passing, no API keys, ~24s), 17 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval, Phase 3 deduplication, and Phase 6 consolidation tests).
 
 Configuration: `pytest.ini` specifies `pythonpath = src tests` (space-separated, not comma-separated — comma breaks pytest) and `testpaths = tests`.
 
