@@ -134,6 +134,32 @@ def _compute_psur_chunks(period_start: date, period_end: date,
     return chunks
 
 
+def _extract_drug_names(report: dict) -> list:
+    """Pulls patient.drug[].medicinalproduct for every drug on the case (suspect,
+    concomitant, and interacting alike — drug-name matching elsewhere in this file
+    is already characterization-agnostic, so this stays consistent). Filters blanks,
+    dedupes while preserving order."""
+    raw_drugs = report.get('patient', {}).get('drug') or []
+    names = []
+    seen = set()
+    for d in raw_drugs:
+        name = d.get('medicinalproduct')
+        if name and name.strip() and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _parse_version(raw) -> int:
+    """Parses safetyreportversion to int, defaulting to 1 if missing/unparseable
+    (a genuinely missing version is treated as 'version 1' — documented limitation,
+    there's no better fallback without the field)."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _merge_chunks(chunk_results: list) -> list:
     """First-seen-wins merge on report_id across chunks, in chronological chunk order.
 
@@ -144,17 +170,23 @@ def _merge_chunks(chunk_results: list) -> list:
     content matching and audited dedup statistics across reports that have genuinely
     different safetyreportids but represent the same underlying case. Do not extend this
     function with additional dedup heuristics — that belongs in Phase 3.
+
+    Version-aware: if the same report_id recurs with a higher safetyreportversion
+    (FAERS case amendment), the later/higher-version payload replaces the earlier one
+    in place — this is still exact-ID collision resolution, not Phase 3's fuzzy dedup.
     """
-    seen_ids = set()
-    merged = []
+    best_by_id = {}
+    order = []
     for chunk in chunk_results:
         for report in chunk.reports:
             rid = report.get("report_id")
-            if rid in seen_ids:
-                continue
-            seen_ids.add(rid)
-            merged.append(report)
-    return merged
+            existing = best_by_id.get(rid)
+            if existing is None:
+                best_by_id[rid] = report
+                order.append(rid)
+            elif report.get("safetyreportversion", 1) > existing.get("safetyreportversion", 1):
+                best_by_id[rid] = report
+    return [best_by_id[rid] for rid in order]
 
 
 class FDAClient:
@@ -269,7 +301,10 @@ class FDAClient:
                 'is_death': report.get('seriousnessdeath') == '1',
                 'is_hospitalization': report.get('seriousnesshospitalization') == '1',
                 'symptoms': ", ".join(reactions),
-                'company': report.get('companynumb', 'N/A')
+                'company': report.get('companynumb', 'N/A'),
+                'symptom_list': reactions,
+                'drug_names': _extract_drug_names(report),
+                'safetyreportversion': _parse_version(report.get('safetyreportversion')),
             }
             flattened.append(entry)
         return flattened

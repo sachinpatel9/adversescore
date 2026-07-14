@@ -2,10 +2,10 @@
 
 **AdverseScore** is an agentic pharmacovigilance tool for consolidating FAERS adverse event data into Periodic Safety Update Reports (PSURs). Given a drug name and reporting period, it resolves the drug's canonical identity, retrieves and deduplicates case reports, ranks signals deterministically, and exports structured `.docx` documents aligned to ICH E2C(R2) PBRER format. All outputs are marked as draft pending qualified clinical/regulatory review.
 
-**⚠️ REBUILD IN PROGRESS:** The codebase is undergoing active refactoring per `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Phases 0–2 complete** (Foundation Cleanup, Drug Identity Resolution, Chunked FDA Retrieval); **Phases 3–11 pending** (deduplication, ranking engine, document generation, new UI, agent orchestration). The Streamlit chat is currently a placeholder. The old five-capability system (Score Explainability, Signal Narrative Generator, Temporal Trend Analysis, Comparative Scorecard) has been removed and will **not** be rebuilt in this iteration.
+**⚠️ REBUILD IN PROGRESS:** The codebase is undergoing active refactoring per `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Phases 0–3 complete** (Foundation Cleanup, Drug Identity Resolution, Chunked FDA Retrieval, Deduplication); **Phases 4–11 pending** (ranking engine, document generation, new UI, agent orchestration). The Streamlit chat is currently a placeholder. The old five-capability system (Score Explainability, Signal Narrative Generator, Temporal Trend Analysis, Comparative Scorecard) has been removed and will **not** be rebuilt in this iteration.
 
 
-## What's Built (Phase 0–2)
+## What's Built (Phase 0–3)
 
 ### Phase 0: Foundation Cleanup
 Removed all code tied to the old five-capability system (composite scoring, narrative generation, temporal trend charts, portfolio scorecard, history panel). The repository is now clean slate for the PSUR consolidation rebuild.
@@ -24,18 +24,25 @@ Given resolved drug identity (name variants + market authorization date), retrie
 - **IBD-anchored period computation** — PSUR cycles anchored to the drug's market authorization date (International Birth Date in ICH E2C(R2) terminology), selecting the most recently *completed* fixed-length cycle (6-month, 1-year, 2-year, or 3-year)
 - **Quarterly chunking** — Slices PSUR period into sub-chunks (default 3-month windows), labeled with explicit date ranges (`chunk-{i}-YYYYMMDD-to-YYYYMMDD`)
 - **Pagination with ceiling** — Paginates each chunk using `skip`/`limit`, capped at 25,000 (openFDA hard limit). Flags chunks as `truncated=True` if ceiling is hit; per-chunk errors don't abort other chunks
-- **Boundary-collision dedup** — First-seen-wins merge on `report_id` across chunks to handle inclusive date-range boundaries (chunk i and i+1 may share an event_date if it lands exactly on the boundary)
+- **Boundary-collision dedup** — Version-aware merge on `report_id` across chunks to handle inclusive date-range boundaries (chunk i and i+1 may share an event_date if it lands exactly on the boundary); higher `safetyreportversion` wins on collision
 - **OTC fallback** — For OTC monograph drugs (no market authorization date) or drugs approved less than one full period ago (no completed cycle yet), falls back to rolling lookback from today (flagged with reason)
 
 Returns `PSURRetrievalResult` with per-chunk metadata (retrieved/estimated counts, truncation flags, optional per-chunk errors) and merged report list. No circular imports with `drug_identity.py` — accepts plain primitives (name variants list, optional date, period string).
 
+### Phase 3: Deduplication
+Given a flattened list of FAERS case reports (from Phase 2's `fetch_psur_reports()`), the `deduplication.py` module removes duplicates in two passes:
+- **Exact `safetyreportid` matching with version awareness** — Groups reports by `report_id`, keeps the highest `safetyreportversion` per ID. Reports with missing/`None` `report_id` receive unique synthetic keys and never collapse into each other (defensive measure against malformed upstream data).
+- **Fallback heuristic matching on survivors** — Two reports with *different* `report_id`s are treated as duplicates only if their full normalized `drug_names` set AND full normalized `symptom_list` set AND `receivedate` are ALL identical (deliberately strict to avoid over-merging genuinely distinct multi-symptom cases). Reports with empty `drug_names` or empty `symptom_list` are excluded from heuristic matching.
 
-## Planned Architecture (Phases 3–11)
+Returns `DedupResult` with original reports, input/output counts, per-method removal counts, and audit trail (list of removal decisions). Known limitation: `date` is `receivedate` (FDA receipt date), not a true per-reaction adverse-event onset date — FAERS lacks a single unambiguous event date, so this is the proxy used here and elsewhere in the codebase.
+
+
+## Planned Architecture (Phases 4–11)
 
 The full PSUR consolidation workflow (currently under build) will combine:
 
 1. ✅ **Chunked FDA Retrieval** (Phase 2, DONE) — Break PSUR periods into quarterly chunks to stay within openFDA's 25K-record skip ceiling; retrieve and merge results, flagging any per-chunk truncation.
-2. **Deduplication** (Phase 3) — Match case reports on `safetyreportid`, with fallback heuristic matching (normalized drug name + MedDRA term + event date) for FAERS ID gaps.
+2. ✅ **Deduplication** (Phase 3, DONE) — Match case reports on exact `safetyreportid` with version awareness, with fallback heuristic matching (full-set equality on normalized drug names + symptom list + receipt date) for FAERS ID gaps. Audit trail of all removal decisions included in output.
 3. **Signal Ranking** (Phase 4–5) — Deterministic 4-criteria ranking (Seriousness & Outcome, Strength of Evidence, Reversibility, Public Health Impact), using reusable PRR math + label-status weighting. The LLM's role is **only to narrate** the pre-computed ranking, not to compute or override it.
 4. **Document Generation** (Phase 6–7) — Produce `.docx` files with ICH E2C(R2) PBRER structure: signal-related sections populated with real data, all other sections filled with explicit placeholders (per Guardrail 2). Embedded guardrails: draft marking (Guardrail 3), completeness metadata (Guardrail 5), ranking formula version (Guardrail 6).
 5. **New Persistence** (Phase 7) — SQLite schema for consolidated datasets + conversation history, enabling multi-turn follow-ups on cached data without re-querying FDA.
@@ -54,6 +61,7 @@ adversescore/
 │       ├── config.py                      # API keys + named constants (Phase 1–2 additions)
 │       ├── drug_identity.py               # Drug resolution (Phase 1)
 │       ├── fda_client.py                  # openFDA HTTP client + PSUR chunked retrieval (Phase 2)
+│       ├── deduplication.py               # Deduplication engine (Phase 3)
 │       ├── client.py                      # Reduced orchestrator (removed scoring methods)
 │       ├── prr.py                         # PRR + Wald 95% CI (unchanged)
 │       ├── label_classifier.py            # Label classification only (removed penalty)
@@ -67,7 +75,8 @@ adversescore/
 ├── tests/
 │   ├── conftest.py                        # Pytest fixtures
 │   ├── unit/
-│   │   ├── test_fda_client.py             # Includes Phase 2 PSUR chunking tests
+│   │   ├── test_fda_client.py             # Includes Phase 2 PSUR chunking tests, Phase 3 flatten/merge tests
+│   │   ├── test_deduplication.py          # Phase 3 deduplication tests
 │   │   ├── test_prr.py
 │   │   ├── test_label_classifier.py
 │   │   ├── test_persistence.py
@@ -76,7 +85,8 @@ adversescore/
 │   │   └── test_drug_identity.py          # Phase 1
 │   └── e2e/
 │       ├── test_fda_client_e2e.py
-│       ├── test_fda_client_psur_e2e.py    # NEW (Phase 2)
+│       ├── test_fda_client_psur_e2e.py    # Phase 2
+│       ├── test_deduplication_e2e.py      # NEW (Phase 3)
 │       ├── test_prr_e2e.py
 │       └── test_drug_identity_e2e.py      # Phase 1
 ├── pytest.ini                             # pythonpath=src tests, testpaths=tests
@@ -128,7 +138,7 @@ OPENFDA_API_KEY=your_fda_key_here
 ```
 
 4. Running Tests (Current Recommendation)
-Since the Streamlit UI is a placeholder, focus on running the test suite to validate the current Phase 0–1 work:
+Since the Streamlit UI is a placeholder, focus on running the test suite to validate the current Phase 0–3 work:
 
 ```bash
 # Unit tests only (fast, no API keys required)
@@ -141,7 +151,7 @@ pytest tests/e2e -v -m e2e
 pytest -v
 ```
 
-**Current test status:** 81 unit tests passing (~24s), 15 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval tests).
+**Current test status:** 99 unit tests passing (~24s), 16 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval and Phase 3 deduplication tests).
 
 5. Launching the Placeholder UI (Not Recommended Yet)
 ```bash
@@ -155,7 +165,7 @@ The chat is a placeholder pending Phase 8 completion.
 
 - **Phase 0–1:** ✅ Foundation cleanup, drug identity resolution
 - **Phase 2:** ✅ Chunked FDA retrieval
-- **Phase 3:** Deduplication engine
+- **Phase 3:** ✅ Deduplication engine
 - **Phase 4–5:** Signal ranking (deterministic 4-criteria)
 - **Phase 6–7:** `.docx` document generation, new persistence schema
 - **Phase 8–10:** Multi-turn agent, new UI, guardrail orchestration

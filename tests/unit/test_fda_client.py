@@ -173,6 +173,79 @@ class TestFlattenResults:
         """A response with 'results': [] returns an empty list."""
         assert client._flatten_results({"results": []}) == []
 
+    def test_flatten_results_extracts_drug_names(self, client):
+        """A multi-drug raw report produces a correct, order-preserving, deduped drug_names list."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-100",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "patient": {
+                "reaction": [{"reactionmeddrapt": "NAUSEA"}],
+                "drug": [
+                    {"medicinalproduct": "KEYTRUDA"},
+                    {"medicinalproduct": "ASPIRIN"},
+                    {"medicinalproduct": "KEYTRUDA"},   # duplicate, must be deduped
+                    {"medicinalproduct": ""},            # blank, must be filtered
+                    {"medicinalproduct": None},          # missing, must be filtered
+                ],
+            },
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["drug_names"] == ["KEYTRUDA", "ASPIRIN"]
+
+    def test_flatten_results_symptom_list_is_individual_terms(self, client):
+        """symptom_list holds the individual MedDRA PTs (not joined), distinct from 'symptoms'."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-101",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "patient": {
+                "reaction": [
+                    {"reactionmeddrapt": "NAUSEA"},
+                    {"reactionmeddrapt": "FATIGUE"},
+                ],
+                "drug": [{"medicinalproduct": "KEYTRUDA"}],
+            },
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["symptom_list"] == ["NAUSEA", "FATIGUE"]
+        assert flat[0]["symptoms"] == "NAUSEA, FATIGUE"
+
+    def test_flatten_results_safetyreportversion_parsed(self, client):
+        """A valid numeric-string safetyreportversion is parsed to an int."""
+        raw = {"results": [{
+            "safetyreportid": "RPT-102",
+            "receivedate": "20250101",
+            "seriousness": "1",
+            "safetyreportversion": "3",
+            "patient": {"reaction": [], "drug": []},
+        }]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["safetyreportversion"] == 3
+        assert isinstance(flat[0]["safetyreportversion"], int)
+
+    def test_flatten_results_safetyreportversion_defaults_to_one(self, client):
+        """Missing or malformed safetyreportversion defaults to 1."""
+        raw = {"results": [
+            {
+                "safetyreportid": "RPT-103",
+                "receivedate": "20250101",
+                "seriousness": "1",
+                "patient": {"reaction": [], "drug": []},
+                # no safetyreportversion key at all
+            },
+            {
+                "safetyreportid": "RPT-104",
+                "receivedate": "20250101",
+                "seriousness": "1",
+                "safetyreportversion": "not-a-number",
+                "patient": {"reaction": [], "drug": []},
+            },
+        ]}
+        flat = client._flatten_results(raw)
+        assert flat[0]["safetyreportversion"] == 1
+        assert flat[1]["safetyreportversion"] == 1
+
 
 # ── Label Text + Class/Peer Discovery ─────────────────────────────────────
 
@@ -565,3 +638,39 @@ class TestMergeChunks:
                              retrieved_count=1, estimated_total_count=1, truncated=False)
         merged = _merge_chunks([chunk1, chunk2])
         assert [r["report_id"] for r in merged] == ["A", "B"]
+
+    def test_higher_version_wins_on_collision(self):
+        """Same report_id in two chunks with different safetyreportversion: the higher-version
+        payload replaces the lower-version one, but position in output order (from first
+        occurrence) is preserved."""
+        low_version = {**_flat_report("SHARED-ID"), "safetyreportversion": 1, "company": "OLD-PAYLOAD"}
+        high_version = {**_flat_report("SHARED-ID"), "safetyreportversion": 2, "company": "NEW-PAYLOAD"}
+        chunk1 = ChunkResult(label="chunk-1", start_date="20240101", end_date="20240401",
+                             reports=[low_version, _flat_report("UNIQUE-1")],
+                             retrieved_count=2, estimated_total_count=2, truncated=False)
+        chunk2 = ChunkResult(label="chunk-2", start_date="20240401", end_date="20240701",
+                             reports=[high_version],
+                             retrieved_count=1, estimated_total_count=1, truncated=False)
+
+        merged = _merge_chunks([chunk1, chunk2])
+        ids = [r["report_id"] for r in merged]
+        assert ids == ["SHARED-ID", "UNIQUE-1"]  # position from first occurrence preserved
+        shared_entry = next(r for r in merged if r["report_id"] == "SHARED-ID")
+        assert shared_entry["company"] == "NEW-PAYLOAD"
+        assert shared_entry["safetyreportversion"] == 2
+
+    def test_lower_or_equal_version_does_not_overwrite(self):
+        """When the second occurrence has an equal or lower version, the first occurrence's
+        payload is kept unchanged."""
+        first = {**_flat_report("SHARED-ID"), "safetyreportversion": 2, "company": "FIRST-PAYLOAD"}
+        second_equal = {**_flat_report("SHARED-ID"), "safetyreportversion": 2, "company": "SECOND-PAYLOAD"}
+        chunk1 = ChunkResult(label="chunk-1", start_date="20240101", end_date="20240401",
+                             reports=[first],
+                             retrieved_count=1, estimated_total_count=1, truncated=False)
+        chunk2 = ChunkResult(label="chunk-2", start_date="20240401", end_date="20240701",
+                             reports=[second_equal],
+                             retrieved_count=1, estimated_total_count=1, truncated=False)
+
+        merged = _merge_chunks([chunk1, chunk2])
+        assert len(merged) == 1
+        assert merged[0]["company"] == "FIRST-PAYLOAD"
