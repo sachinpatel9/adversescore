@@ -2,10 +2,10 @@
 
 **AdverseScore** is an agentic pharmacovigilance tool for consolidating FAERS adverse event data into Periodic Safety Update Reports (PSURs). Given a drug name and reporting period, it resolves the drug's canonical identity, retrieves and deduplicates case reports, ranks signals deterministically, and exports structured `.docx` documents aligned to ICH E2C(R2) PBRER format. All outputs are marked as draft pending qualified clinical/regulatory review.
 
-**⚠️ REBUILD IN PROGRESS:** The codebase is undergoing active refactoring per `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Phases 0–6 complete** (Foundation Cleanup, Drug Identity Resolution, Chunked FDA Retrieval, Deduplication, Label Status Classification, Deterministic Ranking Engine, Consolidation Orchestration); **Phases 7–11 pending** (document generation, new UI, agent orchestration). The Streamlit chat is currently a placeholder. The old five-capability system (Score Explainability, Signal Narrative Generator, Temporal Trend Analysis, Comparative Scorecard) has been removed and will **not** be rebuilt in this iteration.
+**⚠️ REBUILD IN PROGRESS:** The codebase is undergoing active refactoring per `docs/PSUR_CONSOLIDATION_SCOPE.md` (11-phase plan). **Phases 0–7 complete** (Foundation Cleanup, Drug Identity Resolution, Chunked FDA Retrieval, Deduplication, Label Status Classification, Deterministic Ranking Engine, Consolidation Orchestration, Persistence Layer Redesign); **Phases 8–11 pending** (document generation, new UI, agent orchestration). The Streamlit chat is currently a placeholder. The old five-capability system (Score Explainability, Signal Narrative Generator, Temporal Trend Analysis, Comparative Scorecard) has been removed and will **not** be rebuilt in this iteration.
 
 
-## What's Built (Phase 0–6)
+## What's Built (Phase 0–7)
 
 ### Phase 0: Foundation Cleanup
 Removed all code tied to the old five-capability system (composite scoring, narrative generation, temporal trend charts, portfolio scorecard, history panel). The repository is now clean slate for the PSUR consolidation rebuild.
@@ -51,8 +51,11 @@ Returns `RankingResult` containing a globally-ranked list of `RankedSignal` obje
 ### Phase 6: Consolidation Orchestration
 Single pipeline entry point `consolidate_psur()` wires Phases 1–5 together into one coherent, callable workflow. Accepts a drug name and PSUR period, resolves the drug's identity, retrieves and deduplicates all FAERS reports across the period, classifies symptom labels, and ranks signals across four criteria. Returns `ConsolidationResult` with ranked signals (including per-criterion breakdown), completeness metadata (retrieved vs. estimated report counts, per-chunk truncation flags), deduplication statistics, label status breakdown, and ranking formula version for audit trail. Gracefully handles errors throughout the pipeline via structured `ConsolidationError` (never raises for domain failures). Tested end-to-end against live FAERS data: real consolidation of KEYTRUDA (8,204 reports retrieved, 7,903 after dedup, 2,547 unique signals ranked).
 
+### Phase 7: Persistence Layer Redesign
+SQLite-backed persistence enabling cross-session memory for multi-turn follow-ups without re-querying FDA. `ConsolidationStore` class (renamed from `AnalysisStore`) manages two tables: `consolidations` (canonical_name, period, result_json with full nested `ConsolidationResult`), indexed on (canonical_name, period, created_at DESC) for efficient "latest" lookup; `conversation_messages` (session_id, role, content, optional consolidation_id link), indexed on (session_id, id) and ordered by insertion order to avoid same-timestamp collisions. Serialization via `dataclasses.asdict()` with two deliberate post-processing steps: (1) `DrugIdentity.market_authorization_date` (date object) ↔ ISO string (None passes through for OTC drugs); (2) `PSURRetrievalResult.chunks[].reports` trimmed to `[]` on save — a documented exception to round-trip fidelity since this data is redundant (already in merged/deduplicated report lists) and would cause ~2–3x storage bloat for high-volume drugs. Deserialization reconstructs full `ConsolidationResult` objects (not plain dicts) indistinguishable from freshly-returned ones. New public methods: `save_consolidation()` (inserts new row every time, never overwrites — full history retained for audit trail), `load_consolidation()`, `get_latest_consolidation()`, `list_consolidations()` (lightweight metadata for "resume session" UI), `save_message()`, `get_conversation_history()`. Tests: 18 tests covering schema creation, full round-trip fidelity on real nested instances, None market-authorization-date handling, empty signals, multiple saves without overwriting, filtering, and session ordering.
 
-## Planned Architecture (Phases 7–11)
+
+## Planned Architecture (Phases 8–11)
 
 The full PSUR consolidation workflow (currently under build) will combine:
 
@@ -60,7 +63,7 @@ The full PSUR consolidation workflow (currently under build) will combine:
 2. ✅ **Deduplication** (Phase 3, DONE) — Match case reports on exact `safetyreportid` with version awareness, with fallback heuristic matching (full-set equality on normalized drug names + symptom list + receipt date) for FAERS ID gaps. Audit trail of all removal decisions included in output.
 3. ✅ **Label Status Classification** (Phase 4, DONE) — Batch classify symptoms as LABELED/UNLABELED/LABEL_STATUS_UNKNOWN via substring match against FDA label text. Normalize symptom input (uppercase, deduplicate, sort), return frozen dataclass with per-symptom status and aggregate counts.
 4. ✅ **Signal Ranking** (Phase 5, DONE) — Deterministic 4-criteria ranking (Seriousness & Outcome, Strength of Evidence, Reversibility, Public Health Impact), using reusable PRR math + label-status weighting, with lexicographic tier sort and no composite score. The LLM's role is **only to narrate** the pre-computed ranking, not to compute or override it.
-5. **New Persistence** (Phase 7) — SQLite schema for consolidated datasets + conversation history, enabling multi-turn follow-ups on cached data without re-querying FDA.
+5. ✅ **Persistence Layer** (Phase 7, DONE) — SQLite schema for consolidated datasets + conversation history, enabling multi-turn follow-ups on cached data without re-querying FDA.
 6. **Agent Orchestration & Guardrails** (Phase 8) — Multi-turn LangGraph agent with 7-guardrail system prompt, reusing in-session consolidated data for follow-ups.
 7. **Document Generation** (Phase 9) — Produce `.docx` files with ICH E2C(R2) PBRER structure: signal-related sections populated with real data, all other sections filled with explicit placeholders (per Guardrail 2). Embedded guardrails: draft marking (Guardrail 3), completeness metadata (Guardrail 5), ranking formula version (Guardrail 6).
 8. **New UI & Full Validation** (Phases 10–11) — Streamlit UI with PSUR period selector and ranked-signal display; comprehensive unit/E2E test pass and manual guardrail audit.
@@ -86,7 +89,7 @@ adversescore/
 │       ├── label_classifier.py            # Label classification only (removed penalty)
 │       ├── agent_tools.py                 # Placeholder (to be rebuilt Phase 8)
 │       ├── orchestrator.py                # Placeholder agent_executor=None (to be rebuilt Phase 8)
-│       ├── persistence.py                 # Skeleton (to be rebuilt Phase 7)
+│       ├── persistence.py                 # SQLite persistence + conversation history (Phase 7, DONE)
 │       └── logger.py                      # JSON-structured logging (unchanged)
 ├── data/                                  # SQLite DB (auto-created, gitignored)
 ├── docs/
@@ -172,7 +175,7 @@ pytest tests/e2e -v -m e2e
 pytest -v
 ```
 
-**Current test status:** 147 unit tests passing (~24s), 17 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval, Phase 3 deduplication, and Phase 6 consolidation tests).
+**Current test status:** 161 unit tests passing (~24s), 17 E2E tests (all passing against live openFDA API, including Phase 2 PSUR retrieval, Phase 3 deduplication, Phase 6 consolidation, and Phase 7 persistence round-trip tests).
 
 5. Launching the Placeholder UI (Not Recommended Yet)
 ```bash
@@ -190,7 +193,8 @@ The chat is a placeholder pending Phase 8 completion.
 - **Phase 4:** ✅ Label status classification
 - **Phase 5:** ✅ Signal ranking (deterministic 4-criteria)
 - **Phase 6:** ✅ Consolidation orchestration
-- **Phase 7–9:** `.docx` document generation, new persistence schema, agent orchestration & guardrails
+- **Phase 7:** ✅ Persistence layer & conversation history
+- **Phase 8–9:** Agent orchestration & guardrails, `.docx` document generation
 - **Phase 10–11:** Multi-turn UI, full test suite & end-to-end validation
 
 See `docs/PSUR_CONSOLIDATION_SCOPE.md` for full details.

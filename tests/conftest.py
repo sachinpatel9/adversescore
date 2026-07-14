@@ -235,9 +235,9 @@ def mock_symptom_counts():
 
 @pytest.fixture
 def temp_store(tmp_path):
-    """Provides an AnalysisStore backed by a temporary SQLite DB."""
-    from adverse_score.persistence import AnalysisStore
+    """Provides a ConsolidationStore backed by a temporary SQLite DB."""
+    from adverse_score.persistence import ConsolidationStore
     db_path = tmp_path / "test.db"
-    store = AnalysisStore(db_path=db_path)
+    store = ConsolidationStore(db_path=db_path)
     yield store
     store.close()
