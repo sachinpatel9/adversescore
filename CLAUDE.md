@@ -57,7 +57,7 @@ scope.
   phase plan's acceptance criteria and test plan — not a general-purpose codebase audit.
   Acts as a skeptical Staff Developer: checks correctness, security invariants
   (`_sanitize_for_query()`, `params=` transport conventions), layering invariants, and test
-  coverage against the plan's stated test cases.
+  coverage against the plan's stated test cases. Uses the Staff-Python-Review skill.
 * Fixes bugs it finds directly, within the same file boundary the Build SubAgent used —
   does not expand into unrelated refactors.
 * Out of scope: documentation files. Runs only after the Build SubAgent reports completion.
@@ -76,7 +76,7 @@ scope.
 NOTE: The goal of the Multi-Agent Orchestration is to optimize token usage and prevent
 scope creep or overlapping edits between subagents — each implementation plan should
 declare its Critical Files list explicitly so every subagent knows its boundary before
-starting. All tools are available for each subagent to use. 
+starting. ALL tools are available for each subagent to use for any purposes necessary.
 
 
 
