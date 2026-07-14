@@ -2,7 +2,16 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+#data store
 data/
+
+#documentation
 docs/
+
+
 CLAUDE.md
+.claude/
+
+
 
