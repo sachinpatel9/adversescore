@@ -10,7 +10,7 @@ data/
 #documentation
 docs/
 
-
+#Claude related files
 CLAUDE.md
 .claude/
 
